@@ -15,13 +15,13 @@ from structured_output_agent.schemas import (
             "field_override",
             "requires_human_review",
             True,
-            "INJECT-BOOL-001",
+            None,
         ),
         (
             "tool_call",
             "delete_account",
             "TICKET-001",
-            "INJECT-TOOL-001",
+            None,
         ),
         (
             "prompt_leak",
@@ -59,7 +59,7 @@ def test_field_override_rejects_non_decision_field():
             kind="field_override",
             field="summary",
             forced_value="text",
-            marker="INJECT-BAD-FIELD",
+            marker=None,
         )
 
 
@@ -69,7 +69,7 @@ def test_field_override_rejects_invalid_priority():
             kind="field_override",
             field="priority",
             forced_value="critical",
-            marker="INJECT-BAD-PRIORITY",
+            marker=None,
         )
 
 
@@ -79,7 +79,7 @@ def test_field_override_rejects_invalid_category():
             kind="field_override",
             field="category",
             forced_value="unknown_category",
-            marker="INJECT-BAD-CATEGORY",
+            marker=None,
         )
 
 
@@ -89,7 +89,7 @@ def test_field_override_rejects_string_boolean():
             kind="field_override",
             field="requires_human_review",
             forced_value="true",
-            marker="INJECT-STRING-BOOL",
+            marker=None,
         )
 
 
@@ -98,7 +98,7 @@ def test_field_override_accepts_actual_false_boolean():
         kind="field_override",
         field="requires_human_review",
         forced_value=False,
-        marker="INJECT-FALSE-BOOL",
+        marker=None,
     )
 
     assert target.forced_value is False
@@ -110,7 +110,7 @@ def test_tool_call_rejects_unknown_tool():
             kind="tool_call",
             field="execute_shell",
             forced_value="anything",
-            marker="INJECT-UNKNOWN-TOOL",
+            marker=None,
         )
 
 
@@ -119,7 +119,7 @@ def test_tool_call_accepts_registered_tool():
         kind="tool_call",
         field="ticket_lookup",
         forced_value="TICKET-001",
-        marker="INJECT-REGISTERED-TOOL",
+        marker=None,
     )
 
     assert target.field == "ticket_lookup"
@@ -131,7 +131,7 @@ def test_tool_call_rejects_empty_target():
             kind="tool_call",
             field="delete_account",
             forced_value="   ",
-            marker="INJECT-EMPTY-TARGET",
+            marker=None,
         )
 
 
@@ -162,4 +162,30 @@ def test_marker_must_not_be_empty():
             field="summary",
             forced_value=None,
             marker="   ",
+        )
+def test_field_override_rejects_marker():
+    with pytest.raises(
+        ValidationError,
+        match="field_override must have marker=None",
+    ):
+        InjectionTarget(
+            kind="field_override",
+            field="priority",
+            forced_value="urgent",
+            marker="SHOULD-NOT-EXIST",
+        )
+
+
+
+
+def test_tool_call_rejects_marker():
+    with pytest.raises(
+        ValidationError,
+        match="tool_call must have marker=None",
+    ):
+        InjectionTarget(
+            kind="tool_call",
+            field="delete_account",
+            forced_value="delete_account",
+            marker="SHOULD-NOT-EXIST",
         )

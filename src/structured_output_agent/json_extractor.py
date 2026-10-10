@@ -80,3 +80,27 @@ def extract_json_object(raw: str) -> dict[str, Any]:
     raise JSONExtractionError(
         "Response did not contain a valid JSON object."
     )
+
+def extract_json_candidate_text(raw: str) -> str | None:
+    """Extract a JSON-object-shaped candidate without parsing it.
+
+    Returns None when no complete object-shaped candidate is found.
+    The returned text is not guaranteed to be valid JSON.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+
+    text = raw.strip()
+
+    # Prefer explicitly fenced blocks.
+    for match in FENCED_BLOCK_PATTERN.finditer(text):
+        candidate = match.group(1).strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            return candidate
+
+    # Otherwise, use the first balanced object in the response.
+    candidates = _balanced_object_candidates(text)
+    if candidates:
+        return candidates[0]
+
+    return None

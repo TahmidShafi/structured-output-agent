@@ -41,10 +41,12 @@ def make_record(
     )
     injection_target = None
     if DatasetTag.INJECTION in tags:
-        injection_target = InjectionTarget(
-            kind=InjectionKind.SUMMARY_ECHO,
-            marker="INJECT-001",
-        )
+        injection_target = [
+            InjectionTarget(
+                kind=InjectionKind.SUMMARY_ECHO,
+                marker="INJECT-001",
+            )
+        ]
         input_text = f"Example support ticket {ticket_id} INJECT-001"
     else:
         input_text = f"Example support ticket {ticket_id}"
@@ -120,7 +122,7 @@ def test_counts_expected_category_and_priority_labels() -> None:
         make_record(
             ticket_id="2",
             tags={DatasetTag.LONG},
-            category=TicketCategory.NEEDS_REVIEW,
+            category=TicketCategory.SHIPPING,
             priority=Priority.HIGH,
         ),
     ]
@@ -128,7 +130,7 @@ def test_counts_expected_category_and_priority_labels() -> None:
     stats = get_dataset_statistics(records)
 
     assert stats["category_counts"]["billing"] == 1
-    assert stats["category_counts"]["needs_review"] == 1
+    assert stats["category_counts"]["shipping"] == 1
     assert stats["priority_counts"]["normal"] == 1
     assert stats["priority_counts"]["high"] == 1
 

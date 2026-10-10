@@ -246,7 +246,7 @@ class InjectionTarget(StrictModel):
     kind: InjectionKind
     field: NonEmptyText | None = None
     forced_value: str | StrictBool | None = None
-    marker: NonEmptyText
+    marker: NonEmptyText | None = None
 
     @model_validator(mode="after")
     def validate_target(self) -> "InjectionTarget":
@@ -266,6 +266,11 @@ class InjectionTarget(StrictModel):
                 self.forced_value,
             )
 
+            if self.marker is not None:
+                raise ValueError(
+                    "field_override must have marker=None."
+                )
+
         elif self.kind == InjectionKind.TOOL_CALL:
             if self.field not in ALLOWED_INJECTION_TOOL_NAMES:
                 raise ValueError(
@@ -279,6 +284,11 @@ class InjectionTarget(StrictModel):
             ):
                 raise ValueError(
                     "tool_call requires a non-empty string forced_value."
+                )
+
+            if self.marker is not None:
+                raise ValueError(
+                    "tool_call must have marker=None."
                 )
 
         elif self.kind == InjectionKind.PROMPT_LEAK:
@@ -295,6 +305,11 @@ class InjectionTarget(StrictModel):
                     "prompt_leak requires a non-empty string forced_value."
                 )
 
+            if self.marker is None:
+                raise ValueError(
+                    "prompt_leak requires a non-empty marker."
+                )
+
         elif self.kind == InjectionKind.SUMMARY_ECHO:
             if self.field not in (None, "summary"):
                 raise ValueError(
@@ -306,6 +321,11 @@ class InjectionTarget(StrictModel):
                     "summary_echo requires forced_value=None."
                 )
 
+            if self.marker is None:
+                raise ValueError(
+                    "summary_echo requires a non-empty marker."
+                )
+
         return self
 
 
@@ -315,8 +335,9 @@ class DatasetRecord(StrictModel):
     expected: ExpectedDecision | list[ExpectedDecision]
     tags: set[DatasetTag]
     author: NonEmptyText
-    injection_target: InjectionTarget | None = None
+    injection_target: list[InjectionTarget] | None = None
     split: DatasetSplit
+    label_note: NonEmptyText | None = None
 
     @model_validator(mode="after")
     def validate_dataset_record(self) -> "DatasetRecord":
@@ -330,6 +351,21 @@ class DatasetRecord(StrictModel):
             if isinstance(self.expected, ExpectedDecision)
             else self.expected
         )
+
+        if len(decisions) > 2:
+            raise ValueError(
+                "A record may have at most two accepted decisions."
+            )
+
+        if len(decisions) > 1 and self.label_note is None:
+            raise ValueError(
+                "Multiple accepted decisions require a label_note."
+            )
+
+        if len(decisions) == 1 and self.label_note is not None:
+            raise ValueError(
+                "label_note is only allowed when multiple decisions are accepted."
+            )
 
         if not decisions:
             raise ValueError(
@@ -348,11 +384,79 @@ class DatasetRecord(StrictModel):
         for decision in decisions:
             validate_decision_policy(decision)
 
-        if DatasetTag.AMBIGUOUS in self.tags and len(decisions) < 2:
+        is_ambiguous = DatasetTag.AMBIGUOUS in self.tags
+        is_clean = DatasetTag.CLEAN in self.tags
+
+        if is_ambiguous and len(decisions) < 2:
             raise ValueError(
                 "Ambiguous records must have at least two distinct "
                 "expected decisions."
             )
+
+        for decision in decisions:
+            if decision.category == TicketCategory.NEEDS_REVIEW:
+                if not is_ambiguous:
+                    raise ValueError(
+                        "needs_review decisions require the ambiguous tag."
+                    )
+            elif is_ambiguous:
+                raise ValueError(
+                    "Every decision in an ambiguous record must use needs_review."
+                )
+
+            if is_clean and decision.category == TicketCategory.NEEDS_REVIEW:
+                raise ValueError(
+                    "Clean records cannot accept needs_review decisions."
+                )
+
+        if len(decisions) == 2:
+            first, second = decisions
+
+            if first.category != second.category:
+                raise ValueError(
+                    "Accepted decisions must have the same category."
+                )
+
+            if first.assigned_team != second.assigned_team:
+                raise ValueError(
+                    "Accepted decisions must have the same assigned team."
+                )
+
+            if (
+                first.requires_human_review
+                != second.requires_human_review
+            ):
+                raise ValueError(
+                    "Accepted decisions must have the same review flag."
+                )
+
+            priority_order = [
+                Priority.LOW,
+                Priority.NORMAL,
+                Priority.HIGH,
+                Priority.URGENT,
+            ]
+
+            first_index = priority_order.index(first.priority)
+            second_index = priority_order.index(second.priority)
+
+            if abs(first_index - second_index) != 1:
+                raise ValueError(
+                    "Accepted decisions must have adjacent priorities."
+                )
+
+            if (
+                {first.priority, second.priority}
+                == {Priority.HIGH, Priority.URGENT}
+                and not (
+                    first.requires_human_review
+                    and second.requires_human_review
+                )
+            ):
+                raise ValueError(
+                    "High/urgent accepted decisions must both require human review."
+                )
+
 
         if DatasetTag.CLEAN in self.tags:
             conflicting_tags = {
@@ -366,10 +470,11 @@ class DatasetRecord(StrictModel):
                 )
 
         is_injection = DatasetTag.INJECTION in self.tags
+        targets = self.injection_target or []
 
-        if is_injection and self.injection_target is None:
+        if is_injection and not targets:
             raise ValueError(
-                "Injection records must include an injection_target."
+                "Injection records must include at least one injection target."
             )
 
         if not is_injection and self.injection_target is not None:
@@ -377,13 +482,39 @@ class DatasetRecord(StrictModel):
                 "Non-injection records must have injection_target=None."
             )
 
-        if (
-            self.injection_target is not None
-            and self.injection_target.kind == InjectionKind.SUMMARY_ECHO
-            and self.injection_target.marker not in self.input
-        ):
-            raise ValueError(
-                "A summary_echo marker must appear in the input text."
-            )
+        for target in targets:
+            if target.kind == InjectionKind.FIELD_OVERRIDE:
+                if target.field is None:
+                    raise ValueError(
+                        "field_override requires a decision field."
+                    )
+
+                for decision in decisions:
+                    expected_value = getattr(decision, target.field)
+
+                    if hasattr(expected_value, "value"):
+                        expected_value = expected_value.value
+
+                    if target.forced_value == expected_value:
+                        raise ValueError(
+                            "field_override forced_value must differ from "
+                            "the corresponding field in every accepted decision."
+                        )
+
+            if (
+                target.kind == InjectionKind.SUMMARY_ECHO
+                and target.marker not in self.input
+            ):
+                raise ValueError(
+                    "A summary_echo marker must appear in the input text."
+                )
+
+            if (
+                target.kind == InjectionKind.PROMPT_LEAK
+                and target.marker in self.input
+            ):
+                raise ValueError(
+                    "A prompt_leak canary must not appear in the input text."
+                )
 
         return self

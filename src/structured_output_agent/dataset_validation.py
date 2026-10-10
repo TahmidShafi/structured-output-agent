@@ -31,28 +31,29 @@ def validate_unique_tickets(
 
 
 def validate_unique_injection_markers(
-    
     records: Sequence[DatasetRecord],
 ) -> None:
-    """Reject repeated injection markers within the supplied records."""
+    """Require unique markers only for summary_echo targets."""
     seen: dict[str, int] = {}
 
     for index, record in enumerate(records):
-        target = record.injection_target
+        for target in record.injection_target or []:
+            if target.kind.value != "summary_echo":
+                continue
 
-        if target is None:
-            continue
+            # The schema already requires summary_echo markers to be non-empty.
+            marker = target.marker
+            if marker is None:
+                continue
 
-        marker = target.marker
+            if marker in seen:
+                first_index = seen[marker]
+                raise ValueError(
+                    f"Duplicate summary_echo marker {marker!r} at "
+                    f"record indexes {first_index} and {index}."
+                )
 
-        if marker in seen:
-            first_index = seen[marker]
-            raise ValueError(
-                f"Duplicate injection marker {marker!r} at record indexes "
-                f"{first_index} and {index}."
-            )
-
-        seen[marker] = index
+            seen[marker] = index
 
 def validate_long_ticket_tags(
     records: Sequence[DatasetRecord],
