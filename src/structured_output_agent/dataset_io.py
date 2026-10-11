@@ -3,11 +3,20 @@ import hashlib
 import json
 from pathlib import Path
 
-from .schemas import DatasetRecord
+from .schemas import DatasetRecord, DatasetSplit
 
 
-def load_dataset(path: str | Path) -> list[DatasetRecord]:
-    """Load and validate JSONL dataset records."""
+def load_dataset(
+    path: str | Path,
+    *,
+    split: DatasetSplit | str = DatasetSplit.DEV,
+) -> list[DatasetRecord]:
+    """Load and validate JSONL dataset records, returning only the selected split."""
+
+    try:
+        selected_split = DatasetSplit(split)
+    except ValueError as exc:
+        raise ValueError(f"Invalid dataset split: {split!r}") from exc
 
     dataset_path = Path(path)
     records: list[DatasetRecord] = []
@@ -30,13 +39,24 @@ def load_dataset(path: str | Path) -> list[DatasetRecord]:
 
                 records.append(record)
 
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}") from exc
     except OSError as exc:
         raise OSError(f"Could not read dataset: {dataset_path}") from exc
 
     if not records:
         raise ValueError(f"Dataset is empty: {dataset_path}")
 
-    return records
+    selected_records = [
+        record for record in records if record.split == selected_split
+    ]
+
+    if not selected_records:
+        raise ValueError(
+            f"No records with split {selected_split.value!r}: {dataset_path}"
+        )
+
+    return selected_records
 
 
 def sha256_file(path: str | Path) -> str:
