@@ -9,6 +9,7 @@ from structured_output_agent.schemas import (
     CATEGORY_TEAM_MAP,
     ExpectedDecision,
     TicketCategory,
+    TicketInput,
     TicketTriageOutput,
     parse_ticket_input,
     validate_decision_policy,
@@ -104,6 +105,52 @@ def test_empty_ticket_raises_typed_exception():
 def test_valid_ticket_input_is_trimmed():
     result = parse_ticket_input("  I was charged twice.  ")
     assert result.input == "I was charged twice."
+
+
+def test_dict_ticket_input_is_trimmed():
+    result = parse_ticket_input({"input": "  I was charged twice.  "})
+    assert result.input == "I was charged twice."
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "\n\t ",
+        None,
+        42,
+        ["I was charged twice."],
+        {},
+        {"text": "wrong key"},
+        {"input": "   "},
+        {"input": 7},
+        {"input": None},
+        {"input": "I was charged twice.", "extra": "not allowed"},
+    ],
+)
+def test_invalid_ticket_input_raises_domain_exception(raw):
+    with pytest.raises(InvalidTicketInput):
+        parse_ticket_input(raw)
+
+
+@pytest.mark.parametrize("raw", [None, 42, {"input": 7}])
+def test_invalid_ticket_input_chains_pydantic_error(raw):
+    with pytest.raises(InvalidTicketInput) as excinfo:
+        parse_ticket_input(raw)
+
+    assert isinstance(excinfo.value.__cause__, ValidationError)
+
+
+def test_ticket_over_max_length_raises_domain_exception():
+    raw = "x" * 20_001
+
+    with pytest.raises(ValidationError):
+        TicketInput.model_validate({"input": raw})
+
+    with pytest.raises(InvalidTicketInput) as excinfo:
+        parse_ticket_input(raw)
+
+    assert isinstance(excinfo.value.__cause__, ValidationError)
 
 
 def test_category_team_map_matches_policy_table():

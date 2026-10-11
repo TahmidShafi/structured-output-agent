@@ -355,8 +355,13 @@ def test_ambiguous_record_requires_needs_review_decisions():
                 label_note="Invalid ambiguous decisions.",
             )
         )
+
+
 def test_high_urgent_pair_requires_review_for_both():
-    with pytest.raises(ValidationError):
+    with pytest.raises(
+        ValidationError,
+        match="High/urgent accepted decisions must both require human review.",
+    ):
         DatasetRecord.model_validate(
             make_record(
                 expected=[
@@ -372,6 +377,77 @@ def test_high_urgent_pair_requires_review_for_both():
                     ),
                 ],
                 label_note="Testing review consistency.",
+            )
+        )
+
+
+def test_high_urgent_pair_with_review_for_both_is_accepted():
+    record = DatasetRecord.model_validate(
+        make_record(
+            expected=[
+                make_decision(
+                    TicketCategory.BILLING,
+                    Priority.HIGH,
+                    requires_human_review=True,
+                ),
+                make_decision(
+                    TicketCategory.BILLING,
+                    Priority.URGENT,
+                ),
+            ],
+            label_note="Borderline between high and urgent priority.",
+        )
+    )
+
+    assert len(record.expected) == 2
+
+
+@pytest.mark.parametrize("high_requires_review", [True, False])
+def test_validator_b_rejects_urgent_decision_without_review(
+    high_requires_review,
+):
+    urgent = ExpectedDecision(
+        category=TicketCategory.BILLING,
+        priority=Priority.URGENT,
+        assigned_team=AssignedTeam.PAYMENTS,
+        requires_human_review=False,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="Validator B: urgent priority requires human review.",
+    ):
+        DatasetRecord.model_validate(
+            make_record(
+                expected=[
+                    make_decision(
+                        TicketCategory.BILLING,
+                        Priority.HIGH,
+                        requires_human_review=high_requires_review,
+                    ),
+                    urgent,
+                ],
+                label_note="Testing unreviewed urgent decision.",
+            )
+        )
+
+
+def test_non_urgent_pair_with_mixed_review_flags_is_rejected():
+    with pytest.raises(
+        ValidationError,
+        match="Accepted decisions must have the same review flag.",
+    ):
+        DatasetRecord.model_validate(
+            make_record(
+                expected=[
+                    make_decision(TicketCategory.BILLING, Priority.NORMAL),
+                    make_decision(
+                        TicketCategory.BILLING,
+                        Priority.HIGH,
+                        requires_human_review=True,
+                    ),
+                ],
+                label_note="Testing mixed review flags.",
             )
         )
 

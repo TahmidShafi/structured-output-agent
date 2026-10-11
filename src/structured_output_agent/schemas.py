@@ -8,6 +8,7 @@ from pydantic import (
     Field,
     StrictBool,
     StringConstraints,
+    ValidationError,
     model_validator,
 )
 
@@ -143,7 +144,11 @@ class ExpectedDecision(StrictModel):
 
 
 def parse_ticket_input(raw: str | dict[str, object]) -> TicketInput:
-    """Validate input before any model inference."""
+    """Validate input before any model inference.
+
+    Raises InvalidTicketInput when the input is empty or fails validation. The
+    Pydantic ValidationError is chained as __cause__ when validation fails.
+    """
     from .exceptions import InvalidTicketInput
 
     value = raw.get("input") if isinstance(raw, dict) else raw
@@ -151,15 +156,12 @@ def parse_ticket_input(raw: str | dict[str, object]) -> TicketInput:
     if isinstance(value, str) and not value.strip():
         raise InvalidTicketInput("Ticket input must not be empty.")
 
-    if isinstance(raw, str):
-        raw = {"input": raw}
+    payload = {"input": raw} if isinstance(raw, str) else raw
 
-    ticket = TicketInput.model_validate(raw)
-
-    if not ticket.input:
-        raise InvalidTicketInput("Ticket input must not be empty.")
-
-    return ticket
+    try:
+        return TicketInput.model_validate(payload)
+    except ValidationError as error:
+        raise InvalidTicketInput("Ticket input is invalid.") from error
 
 
 def validate_decision_policy(
@@ -423,6 +425,18 @@ class DatasetRecord(StrictModel):
                 )
 
             if (
+                {first.priority, second.priority}
+                == {Priority.HIGH, Priority.URGENT}
+                and not (
+                    first.requires_human_review
+                    and second.requires_human_review
+                )
+            ):
+                raise ValueError(
+                    "High/urgent accepted decisions must both require human review."
+                )
+
+            if (
                 first.requires_human_review
                 != second.requires_human_review
             ):
@@ -444,19 +458,6 @@ class DatasetRecord(StrictModel):
                 raise ValueError(
                     "Accepted decisions must have adjacent priorities."
                 )
-
-            if (
-                {first.priority, second.priority}
-                == {Priority.HIGH, Priority.URGENT}
-                and not (
-                    first.requires_human_review
-                    and second.requires_human_review
-                )
-            ):
-                raise ValueError(
-                    "High/urgent accepted decisions must both require human review."
-                )
-
 
         if DatasetTag.CLEAN in self.tags:
             conflicting_tags = {
