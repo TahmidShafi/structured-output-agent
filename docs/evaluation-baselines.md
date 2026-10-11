@@ -58,6 +58,10 @@ Strict accuracy is calculated as:
 
 Each ticket contributes at most one correct result.
 
+An eligible ticket is a development record that passes schema validation during loading and passes dataset integrity validation (`validate_dataset_integrity`). The denominator is the number of eligible tickets, not the number of accepted expected decisions. A ticket with two accepted decisions still counts once.
+
+Cross-split duplicate detection is not part of this rule and is not performed by these baselines.
+
 
 
 ## 3. Majority Complete-Decision Baseline
@@ -202,3 +206,5 @@ The development dataset was fingerprinted using SHA-256 over the exact file byte
 - **Recorded on:** 2026-10-11
 
 Recalculate this hash whenever the dataset changes. A different hash indicates that the file bytes differ; it does not, by itself, establish whether the changes are intentional or correct.
+
+The hash is computed over the exact bytes on disk. On the Windows development checkout (`core.autocrlf=true`), the working-tree file uses CRLF line endings, while the tracked blob is stored with LF. The SHA-256 above therefore corresponds to the CRLF working-tree file. Hashing the LF-normalized content produces a different digest. Record which form was hashed whenever the hash is recalculated.
