@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from structured_output_agent.baselines import (
+    _tie_break_key,
     always_needs_review_decision,
     majority_decision,
     strict_correctness,
@@ -85,6 +86,65 @@ def test_majority_breaks_ties_by_priority_order_not_alphabetically():
     ]
 
     assert majority_decision(records).priority == Priority.LOW
+
+
+def test_tie_break_key_compares_assigned_team_alphabetically():
+    dec_account = ExpectedDecision(
+        category=TicketCategory.OTHER,
+        priority=Priority.NORMAL,
+        assigned_team=AssignedTeam.ACCOUNT_SUPPORT,
+        requires_human_review=False,
+    )
+    dec_general = ExpectedDecision(
+        category=TicketCategory.OTHER,
+        priority=Priority.NORMAL,
+        assigned_team=AssignedTeam.GENERAL_SUPPORT,
+        requires_human_review=False,
+    )
+
+    # Preceding fields (category, priority) are equal
+    key_account = _tie_break_key(dec_account)
+    key_general = _tie_break_key(dec_general)
+    assert key_account[:2] == key_general[:2]
+    assert key_account[2] == "account_support"
+    assert key_general[2] == "general_support"
+    # Assigned team is the deciding field (alphabetical rule)
+    assert key_account < key_general
+
+
+def test_majority_breaks_ties_by_assigned_team_alphabetically():
+    dec_account = ExpectedDecision(
+        category=TicketCategory.OTHER,
+        priority=Priority.NORMAL,
+        assigned_team=AssignedTeam.ACCOUNT_SUPPORT,
+        requires_human_review=False,
+    )
+    dec_general = ExpectedDecision(
+        category=TicketCategory.OTHER,
+        priority=Priority.NORMAL,
+        assigned_team=AssignedTeam.GENERAL_SUPPORT,
+        requires_human_review=False,
+    )
+    records = [
+        DatasetRecord.model_construct(
+            input="Ticket 1",
+            expected=dec_general,
+            tags={DatasetTag.CLEAN},
+            author="test",
+            split=DatasetSplit.DEV,
+        ),
+        DatasetRecord.model_construct(
+            input="Ticket 2",
+            expected=dec_account,
+            tags={DatasetTag.CLEAN},
+            author="test",
+            split=DatasetSplit.DEV,
+        ),
+    ]
+
+    assert (
+        majority_decision(records).assigned_team == AssignedTeam.ACCOUNT_SUPPORT
+    )
 
 
 def test_majority_breaks_ties_with_false_before_true_review_flag():
