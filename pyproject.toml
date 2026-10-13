@@ -16,6 +16,12 @@ dev = [
     "pytest>=8,<9",
     "ruff>=0.9,<1",
 ]
+gemini = [
+    "google-genai>=1.0.0,<3.0.0",
+]
+
+[project.scripts]
+structured-output-agent = "structured_output_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -24,6 +30,9 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra"
+markers = [
+    "gemini: tests requiring the optional google-genai package",
+]
 
 [tool.ruff]
 line-length = 88
