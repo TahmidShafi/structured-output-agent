@@ -29,3 +29,11 @@ class ToolResultMismatchError(ToolExecutionError):
 
 class RetryExhaustedError(AgentError):
     """The agent could not produce a valid result within its retry budget."""
+
+
+class OperationalError(AgentError):
+    """Operational or infrastructure failure during model invocation.
+
+    Operational failures (e.g., transport errors, timeouts, rate limits) abort
+    the evaluation run and are not counted as model-output failures (O1-O3).
+    """
