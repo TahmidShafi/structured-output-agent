@@ -1,6 +1,6 @@
 # Evaluation Policy
 
-**Status:** Draft specification, not frozen
+**Status:** Draft specification, reconciled with Stage 1–6 implementation
 
 **Scope:** Development-set evaluation of the ticket-triage agent
 
@@ -8,162 +8,238 @@
 
 **Protected data:** `evals/data/test.jsonl`. Not used for any evaluation until Section 9 is satisfied.
 
+---
+
 ## 1. Purpose and Boundaries
 
-This document defines how a development-set evaluation run is specified, what counts as a failure, how failures are reported, and what must be frozen before any held-out evaluation.
+This document defines how a development-set evaluation run is specified, what counts as a failure, how retry and recovery attempts are executed and reported, how metrics are computed, and what must be frozen before any held-out evaluation.
 
-It does not define a pass threshold, select a model provider, add an output confidence field, or change the policy constants in `schemas.py`.
+The evaluation harness implements deterministic prompt building, length-prefixed dataset fingerprinting, a configurable retry loop with sanitized feedback, structured failure logging, expanded evaluation metrics, offline paired strategy comparisons, and atomic checkpointing.
+
+This document does not define a pass threshold, select a live production model provider, or change the policy constants in [`src/structured_output_agent/schemas.py`](../src/structured_output_agent/schemas.py).
+
+---
 
 ## 2. Eligibility and Denominator
 
 - An eligible ticket is a record loaded with `load_dataset` at the default `dev` split that also passes `validate_dataset_integrity`.
 - `load_dataset` raises on the first invalid line ([dataset_io.py:36-38](../src/structured_output_agent/dataset_io.py#L36-L38)). No record is excluded individually. A dataset with any invalid record cannot be evaluated.
 - `load_dataset` does not call `validate_dataset_integrity`. The evaluation runner must call it explicitly before the first model attempt.
-- The denominator is the number of eligible tickets, fixed before the first model attempt. It is not reduced by model failures.
+- The denominator `N` is the number of eligible tickets, fixed before the first model attempt. It is not reduced by model failures, operational aborts, or retry exhaustion.
 - A ticket with two accepted decisions counts once.
+
+---
 
 ## 3. Strict Correctness and Record Credit
 
 - A prediction is strictly correct when its four decision fields (`category`, `priority`, `assigned_team`, `requires_human_review`) match at least one accepted decision for the ticket.
 - Each ticket contributes at most one credit, even when it has two accepted decisions.
-- Only the four decision fields are compared. `summary` is excluded ([schemas.py:130](../src/structured_output_agent/schemas.py#L130)).
+- Only the four decision fields are compared. `summary` is excluded ([schemas.py:164-171](../src/structured_output_agent/schemas.py#L164-L171)).
 - Weighted support is used only to select the majority baseline's prediction. Model predictions are scored with the per-ticket rule above and receive no weighting.
-- Strict accuracy is `correct tickets / eligible tickets`.
+- Strict accuracy is `correct tickets / eligible tickets` (`O5 / N`).
+
+---
 
 ## 4. Prediction Outcome Taxonomy
 
-Each eligible ticket receives exactly one outcome from one attempt.
+Each eligible ticket is classified into an outcome on each attempt, concluding with a single final outcome after attempt exhaustion or valid resolution.
 
-| Outcome | Definition | Strict credit |
-|---|---|---|
-| O1 Parse failure | No usable JSON object could be extracted: empty response, no parseable object, or competing parseable objects. | 0 |
-| O2 Schema failure | An object was extracted but fails `TicketTriageOutput` validation, for example an extra field, an invalid enum value, an over-length summary, or a non-boolean review flag. | 0 |
-| O3 Policy failure | The output passes schema validation but fails `validate_decision_policy` (Validator A: team must match category; Validator B: `needs_review` and `urgent` require human review). | 0 |
-| O4 Valid, incorrect | The output passes schema and policy checks but matches no accepted decision. | 0 |
-| O5 Valid, correct | The output passes schema and policy checks and matches an accepted decision. | 1 |
+| Outcome | Code | Definition | Strict Credit | Schema-Valid | Policy-Valid | Retry Eligible |
+|---|---|---|---|---|---|---|
+| Parse failure | O1 | No usable JSON object could be extracted: empty response, malformed text, or competing parseable objects. | 0 | No | No | Yes (Strategies 2 & 3, Runner) |
+| Schema failure | O2 | An extracted JSON object fails `TicketTriageOutput` validation (e.g., missing fields, extra fields, invalid enums, invalid types, over-length summary). | 0 | No | No | Yes (Strategies 2 & 3, Runner) |
+| Policy failure | O3 | The output passes schema validation but violates `validate_decision_policy` (Validator A category/team mismatch, or Validator B missing human review on `needs_review`/`urgent`). | 0 | Yes | No | Yes (Strategy 3, Runner) |
+| Valid, incorrect | O4 | The output passes schema and policy checks but does not match any accepted ground-truth decision. | 0 | Yes | Yes | No (Terminates attempts) |
+| Valid, correct | O5 | The output passes schema and policy checks and matches at least one accepted ground-truth decision. | 1 | Yes | Yes | No (Terminates attempts) |
 
-Notes:
+### Notes and Invariants:
+- **Model-Output Failures:** O1, O2, and O3 represent model-output failures. O4 is not a failure; a valid `needs_review` prediction on a non-ambiguous ticket is simply incorrect.
+- **Schema Validity vs. Policy Validity:** `TicketTriageOutput` contains no policy validator ([schemas.py:156-162](../src/structured_output_agent/schemas.py#L156-L162)). Therefore, an output categorized as O3 is schema-valid even though it fails policy checks.
+- **Outcome Transitions:** For tickets undergoing retries, attempt transitions are tracked as `Initial -> Final` (e.g., `O2 -> O5`, `O1 -> O2`).
+- **Final Outcome:** Strict evaluation credit and run metrics are evaluated strictly on the final outcome produced after retries conclude.
+- **Recovery:** A ticket is defined as *recovered* if its initial attempt resulted in an eligible failure (O1, O2, or O3) and its final outcome is valid (O4 or O5).
+- **Reported Core Rates:**
+  - Final invalid-output rate: `(O1_final + O2_final + O3_final) / eligible tickets`
+  - Schema-valid rate: `(O3_final + O4_final + O5_final) / eligible tickets`
+  - Accuracy among valid outputs: `O5 / (O4 + O5)` (diagnostic only, not used for ranking)
 
-- O1 to O3 are model-output failures. O4 is not a failure: a valid `needs_review` prediction on a non-ambiguous ticket is simply incorrect.
-- `TicketTriageOutput` contains no policy validator ([schemas.py:121-126](../src/structured_output_agent/schemas.py#L121-L126)). A schema-valid output can therefore fail O3, so the runner must apply `validate_decision_policy` separately.
-- Injection compliance is not an output-validity category. It is a diagnostic on injection-tagged records and is covered in Section 8.
+---
 
-Reported invalid-output rate: `(O1 + O2 + O3) / eligible tickets`.
+## 5. Retry, Recovery, and Fallback Policy
 
-## 5. Retry and Fallback Policy
+### 5.1 Retry Budget Architecture
+- **Configurable Budget:** Controlled by `RunConfig.retry_budget` (default `2`).
+- **Attempt Accounting:** Under the agreed project interpretation, `retry_budget=2` specifies that up to 2 retries are allowed following the initial attempt, permitting a maximum of **3 total attempts** per ticket (`max_attempts = 1 + retry_budget`).
+- **Initial Attempt Policy (`attempts_per_ticket`):** `RunConfig.attempts_per_ticket` is typed as `Literal[1]`. It specifies the single-sample initial generation policy (each ticket receives exactly 1 initial attempt; there are no parallel temperature samples or Best-of-N initial generation). It is a distinct configuration field and is not interchangeable with `retry_budget`.
+- **Retry Eligibility (Production Runner):** In the production evaluation runner ([runner.py:444](../src/structured_output_agent/runner.py#L444)), only eligible model-output failures (O1, O2, and O3) trigger retry attempts.
+- **Non-Retryable Outcomes:** Valid predictions (O4 and O5) terminate attempts immediately. There is no second-guessing or regeneration of valid outputs.
+- **Fast-Abort on Operational Errors:** Infrastructure, transport, timeout, or rate-limit errors (`OperationalError`) never trigger retries; they immediately abort the evaluation run.
+- **No Fallback Predictions:** An invalid output is never replaced by a heuristic or baseline prediction (such as always-needs-review or majority class). A ticket that exhausts its retry budget retains its final failure outcome (O1, O2, or O3) with 0 credit.
 
-- Each eligible ticket receives exactly one model attempt.
-- No automatic retries occur for O1, O2, O3, or any other outcome.
-- No fallback prediction is used. An invalid output is never replaced by always-needs-review or any other baseline.
-- Because there is one attempt, first-attempt and final results are identical. Retry metrics are not reported in the first run.
-- Any future change to retry or fallback behavior requires a new policy version. Runs under different retry policies must not be compared directly.
+### 5.2 Redacted, Actionable Error Feedback
+- On retry turns (Attempt > 1), actionable feedback is appended to the prompt via `generate_actionable_feedback`.
+- All secrets, API keys (Google `AIza...`, OpenAI `sk-...`), bearer tokens, and Pydantic raw payload echoes (`input_value=...`) are scrubbed via `redact_secrets` before insertion into the prompt.
+- Feedback provides actionable schema reminders and deterministic C1 policy rules without echoing raw ticket input text.
 
-## 6. Harness Errors and Model-Output Failures
+### 5.3 Structured Failure Logging
+- When configured via `RunConfig.failure_log_path`, runs write a structured JSONL failure log.
+- Every ticket that undergoes retries or concludes in failure logs an entry recording: `ticket_index`, `attempt_count`, `initial_outcome`, `final_outcome`, `outcome_transition`, `recovered`, and scrubbed error messages.
 
-These are separate categories. Only model-output failures are scored under Section 4.
+---
 
-**Harness errors** occur in the evaluation pipeline, not in the model's response:
+## 6. Harness Errors and Operational Failures
 
+Harness errors and operational failures are separate categories from model-output failures. Only model-output failures are scored under Section 4.
+
+### 6.1 Harness Errors
+Harness errors occur in the evaluation pipeline or configuration:
 - The dataset is missing, unreadable, or invalid; `load_dataset` or `validate_dataset_integrity` fails.
-- The dataset hash does not match the recorded hash.
+- The dataset fingerprint does not match the recorded fingerprint.
 - The run configuration does not match the frozen configuration.
 - The split guard is violated (any split other than `dev` is requested).
-- The scorer or baseline code raises, including the empty-records error in [baselines.py:23-24](../src/structured_output_agent/baselines.py#L23-L24).
+- The scorer or baseline code raises an exception.
 
-Proposed rule (not yet approved): a harness error aborts the run. No partial metrics are reported, and the error is not counted as a model failure.
+When execution aborts due to harness errors (`AgentError`, `ValueError`, `OSError`, or `ImportError`), the CLI exits with code 2. No final report or metrics are written.
 
-**Operational failures** occur when the model call returns no output: transport errors, timeouts, rate limits, or other provider errors. Their treatment is unresolved (Section 10). Approved decision 2 covers only O1 to O3, so operational failures must not be silently folded into those categories.
+### 6.2 Operational Failures and Checkpoint Preservation
+Operational failures occur when the model provider call fails or returns no output due to infrastructure or network errors (such as HTTP 503 `UNAVAILABLE`, HTTP 429 `RESOURCE_EXHAUSTED`, network timeouts, or transport errors).
+
+In this harness:
+- An operational failure raises `OperationalError` and aborts the evaluation run immediately.
+- The CLI exits with code 1.
+- Contiguous prefix results completed prior to the failure are preserved in `EvaluationRun.completed_results` along with `error_type` and `error_message`.
+- If `--checkpoint` was configured, the checkpoint file contains all completed prefix results and remains intact on disk.
+- An aborted run does **not** write a final evaluation report or compute final metrics (`compute_metrics` raises `ValueError` if `run.status != COMPLETED`).
+- Operational failures are not folded into model-output failure outcomes (O1–O3).
+
+---
 
 ## 7. Minimum Run Configuration and Reproducibility Metadata
 
-Each run must record the following before it starts, and the record must be fixed for the duration of the run.
+Each run records the following metadata before execution begins:
 
 **Dataset**
-
 - Dataset path and split (`dev`).
-- SHA-256 of the file and the form that was hashed. The baseline document records the CRLF working-tree form on the Windows checkout ([evaluation-baselines.md](evaluation-baselines.md), Section 8).
-- Eligible ticket count and excluded count (expected to be 0 under Section 2).
+- Dataset SHA-256 fingerprint computed canonically with length-prefixed framing via `compute_dataset_fingerprint`.
+- Eligible ticket count `N` (expected to be 20 for `dev.jsonl`).
 
-**Code and policy**
-
-- Git commit of the evaluation code and whether the working tree was clean.
-- `POLICY_VERSION` and `C1_RULES_VERSION` (currently `1.3` and `c1-1.0.0`).
+**Code and Policy**
+- Git commit of the evaluation code and working-tree status.
+- `POLICY_VERSION` (`1.3`) and `C1_RULES_VERSION` (`c1-1.0.0`).
 - This document's version.
 - Scoring source: commit of `baselines.py` and `evaluation-baselines.md`.
 
 **Procedure**
-
-- Attempts per ticket: 1.
-- Extractor used. The stricter `extract_json_object` is the candidate because it raises on competing objects, but this choice is unresolved (Section 10).
-- Prompt template identifier and content hash. Not yet defined in the repository.
-- Output schema identifier (`TicketTriageOutput` field set).
+- Initial attempts per ticket: 1 (`attempts_per_ticket: Literal[1]`).
+- Retry budget: 2 (`retry_budget: int = 2`, allowing up to 3 total attempts on eligible failures).
+- Extractor used: `extract_json_object` (enforced by `RunConfig`).
+- Prompt template: `DEFAULT_PROMPT_TEMPLATE`, with SHA-256 digest recorded via `compute_prompt_fingerprint`.
+- Output schema identifier: `TicketTriageOutput` field set.
+- Checkpoint version: Version 1 (`checkpoint_version: 1`), verifying dataset and prompt fingerprint identity on resume.
+- Failure log path: Path to structured JSONL failure log when enabled.
 - Run timestamp and output path.
 
-**Unresolved provider-specific fields (not selected in this stage)**
-
+**Provider-Specific Fields (Frozen prior to release)**
 - Model identifier and provider.
-- Decoding settings, including temperature, top_p, maximum output tokens, and seed where supported.
-- Request timeout and rate-limit handling.
+- Decoding settings: temperature, top_p, maximum output tokens, and seed where supported.
+- Request timeout and request pacing interval (e.g., 13.0 seconds for Gemini free-tier pacing).
 - API version or deployment identifier.
 
-These fields must be resolved before any run counts as reproducible.
+---
 
-## 8. Required First-Run Metrics and Baseline Comparisons
+## 8. Required Evaluation Metrics and Baseline Comparisons
 
-Required metrics, all computed on the eligible dev tickets:
+All metrics are computed on the `N` eligible development tickets by [`src/structured_output_agent/metrics.py`](../src/structured_output_agent/metrics.py):
 
-1. Eligible ticket count `N`.
-2. Strict correct count and strict accuracy, with numerator and denominator shown.
-3. Counts for O1, O2, O3, O4, and O5, each reported separately.
-4. Invalid-output rate, `(O1 + O2 + O3) / N`.
-5. Strict accuracy broken down by tag (`clean`, `ambiguous`, `injection`, `long`), with the denominator for each tag.
-6. Count and rate of predictions that require human review.
-7. Baseline comparison on the same dataset and scoring rule. Recorded baseline values are majority 2 / 20 (10%) and always-needs-review 4 / 20 (20%). These must be recomputed in the same run and not copied forward.
+### 8.1 Primary Evaluation Metrics
+1. **Eligible Count (`N`):** Fixed denominator, verified before inference begins.
+2. **Strict Correct Count and Accuracy:** Strict credit awarded where final decision fields match accepted decisions (`O5 / N`). Both numerator and denominator shown.
+3. **Outcome Breakdown:** Counts for O1, O2, O3, O4, and O5 reported separately.
+4. **Invalid-Output Rate:** `(O1 + O2 + O3) / N`.
+5. **Schema-Valid Rate:** `(O3 + O4 + O5) / N`. (Counts all outputs conforming to `TicketTriageOutput` schema).
+6. **Accuracy Among Valid Outputs:** `O5 / (O4 + O5)` (Diagnostic).
+7. **Tag Breakdowns:** Strict accuracy broken down across dataset tags (`clean`, `ambiguous`, `injection`, `long`), with independent denominators for each tag.
+8. **Human Review Rate:** Count and rate of final predictions with `requires_human_review = true`.
+9. **Dynamic Reference Baselines:** Recomputed on the identical eligible records:
+   - Majority baseline (recorded historical dev value: 2 / 20, 10%).
+   - Always-needs-review baseline (recorded historical dev value: 4 / 20, 20%).
 
-Diagnostic metric, not used for ranking: accuracy among valid outputs, `O5 / (O4 + O5)`. Both counts must be shown.
+### 8.2 Expanded Diagnostic Metrics
+10. **Wilson Score Confidence Intervals:** 95% two-sided Wilson intervals computed for binomial proportions (`strict_correct`, `accuracy_among_valid`, `schema_valid`, `human_review_precision`, `human_review_recall`).
+    - *Sampling Uncertainty Limitation:* Confidence intervals reflect binomial sampling variance across the 20 development tickets. They do not demonstrate or guarantee generalization to unseen production data.
+11. **Per-Field Decision Accuracy:** Individual accuracy for `category`, `priority`, `assigned_team`, and `requires_human_review` evaluated against ground-truth decisions across all eligible records (`denominator_rule: "all_eligible_records"`).
+12. **Human-Review Classification Performance:** Complete binary confusion matrix (True Positives, False Positives, True Negatives, False Negatives, Unclassified), precision, recall, and specificity for `requires_human_review` (positive class: `requires_human_review = true`).
+13. **Over- and Under-Escalation Metrics:** Tracks priority over/under escalation and urgent-specific over/under escalation based on the ordered priority hierarchy (`low < normal < high < urgent`).
+    - *Limitation Note:* Human review and escalation are distinct concepts. Because the repository schemas lack an authoritative business escalation policy, priority-hierarchy escalation measurements are provisional diagnostics, not an authoritative business rule.
+14. **Injection Resistance Scoring:** Evaluated on `injection` tag records across 4 attack vectors (`field_override`, `tool_call`, `prompt_leak`, `summary_echo`) and reported with distinct ticket-level resistance (`tickets_resisted`) and target-level resistance (`targets_resisted`). High decision accuracy does not imply injection resistance; they measure separate behaviors.
+15. **Retry Accounting:** Total attempts used, tickets retried, tickets recovered, tickets exhausted, and recovery rate (`tickets_recovered / tickets_retried`).
 
-Not required in the first run: confidence intervals and per-field accuracy. Injection-compliance rate is not required until its detection method is defined (Section 10).
-
-No pass or fail judgment is defined by this document.
+---
 
 ## 9. Test-Set Freeze and Release Criteria
 
-`evals/data/test.jsonl` remains protected. It must not be read, hashed, modified, populated, staged, committed, or used for evaluation until every prerequisite below is met. None is met today.
+`evals/data/test.jsonl` remains protected. It must not be read, hashed, modified, populated, staged, committed, or used for evaluation until every prerequisite below is met:
 
-Freeze prerequisites:
+1. The triage policy [`docs/triage_policy.md`](triage_policy.md) and this evaluation policy are approved and their versions recorded.
+2. The run configuration in Section 7 is complete, including provider-specific decoding parameters.
+3. The retry budget and feedback policy in Section 5 are confirmed.
+4. A pass threshold or decision rule is defined, approved, and justified for sample size `N=20`.
+5. A development run has completed with recorded metadata and published report.
+6. Cross-split duplicate detection has been resolved or explicitly accepted as a limitation.
+7. The test-set hash is recorded at freeze time. Computing that hash requires explicit user approval because it reads the protected file.
 
-1. This policy is approved and its version is recorded.
-2. The run configuration in Section 7 is complete, including the provider-specific fields.
-3. The retry and fallback policy in Section 5 is confirmed.
-4. A pass threshold or decision rule is defined, approved, and justified. This document does not define one.
-5. A development run has completed with recorded metadata.
-6. Cross-split duplicate detection has been resolved or explicitly accepted as a limitation. The baseline document states this check is not performed ([evaluation-baselines.md](evaluation-baselines.md), Section 2).
-7. The test-set hash is recorded at freeze time. Computing that hash requires explicit user approval, because it reads the protected file.
+---
 
-Release criteria: none are defined yet. They depend on the threshold decision in prerequisite 4.
+## 10. Status of Technical Decisions, Historical Reference Facts, and Offline Strategies
 
-## 10. Unresolved Decisions and Contradictions
+### 10.1 Technical Decisions Resolved in Stages 1–6
+- **Extractor Choice:** Resolved to `extract_json_object` in `RunConfig`.
+- **Operational Failure Handling:** Resolved to fast-abort with exit code 1; preserves contiguous checkpoint prefix without publishing an incomplete final report.
+- **Prompt Template and Fingerprinting:** Resolved via `DEFAULT_PROMPT_TEMPLATE` and SHA-256 fingerprinting.
+- **Retry Handling and Accounting:** Resolved via `retry_budget=2` loop, redacted error feedback, and structured JSONL failure logging.
+- **Expanded Metrics and Injection Scoring:** Resolved in `metrics.py` and `injection_scorer.py`.
+- **Offline Strategy Comparisons:** Resolved via `offline_strategies.py`.
 
-**Unresolved decisions**
+### 10.2 Historical Benchmark Reference Facts
+The following verified benchmark results from project history serve as baseline anchors (historical artifacts are not modified):
+- **Gemini v1:** 0 / 20 strict decision accuracy (20 / 20 schema failures O2).
+- **Gemini v2:** 10 / 20 strict decision accuracy.
+- **Gemini v3:** 18 / 20 strict decision accuracy.
+- **Gemini v4:** 19 / 20 strict decision accuracy (95%), with 100% schema-valid rate (best completed historical run).
+  - *Ticket 15 Strict Error:* Priority predicted as `low` instead of expected `normal`.
+  - *Ticket 15 Marker-Echo Injection Failure:* Echoed injection marker in summary, which is scored separately from strict decision accuracy.
+  - *Historical v3 & v4 Injection Resilience:* 4 / 5 ticket-level resistance, 5 / 6 target-level resistance.
+- **Gemini v5:** Interrupted by upstream HTTP 503 service congestion; produced no completed final report.
 
-- Model provider, model identifier, decoding settings, timeout, and rate-limit handling.
-- Treatment of operational failures (Section 6). Options include aborting the run, or scoring as zero credit with a separate count. Excluding them from the denominator is not recommended, because it would inflate accuracy.
-- Extractor choice: `extract_json_object` or `extract_json_candidate_text`.
-- Pass threshold or decision rule. With 20 dev records, each ticket is 5 percentage points, so any threshold needs a sample-size justification.
-- Method for detecting injection compliance on injection-tagged records.
-- Cross-split duplicate detection (Section 9, prerequisite 6).
-- Whether harness errors abort the run, as proposed in Section 6.
+### 10.3 Offline Strategy Comparisons and Simulation Rules
+[`src/structured_output_agent/offline_strategies.py`](../src/structured_output_agent/offline_strategies.py) defines three offline evaluation strategies for comparative analysis:
 
-**Contradictions and gaps found while drafting**
+- **Strategy 1 (No Retry):** Evaluates the persisted initial response (`attempt = 1`). Represents single-attempt baseline performance.
+- **Strategy 2 (Schema-Aware Retry):** Retries only extraction failures (O1) and schema failures (O2). Policy failures (O3) are treated as non-recoverable under this strategy.
+- **Strategy 3 (Schema- and Policy-Aware Retry):** Retries all eligible model-output failures (O1, O2, and O3) with both schema and C1 policy feedback.
 
-- [schemas.py:18](../src/structured_output_agent/schemas.py#L18) cites `triage_policy.md`. No such file is tracked in the repository. The category-to-team mapping exists only as the code constant `CATEGORY_TEAM_MAP`.
-- `SemanticValidationError` is defined ([exceptions.py:18-19](../src/structured_output_agent/exceptions.py#L18-L19)), but `validate_decision_policy` raises plain `ValueError` ([schemas.py:174](../src/structured_output_agent/schemas.py#L174), [schemas.py:183](../src/structured_output_agent/schemas.py#L183), [schemas.py:191](../src/structured_output_agent/schemas.py#L191)). The runner must classify O3 by wrapping these errors. Changing the exception type would modify existing code and is not proposed here.
-- The baseline document describes eligibility per record, but `load_dataset` makes it all-or-nothing per file (Section 2).
-- The baseline document requires `validate_dataset_integrity`, which `load_dataset` does not call.
-- `RetryExhaustedError` is defined ([exceptions.py:30-31](../src/structured_output_agent/exceptions.py#L30-L31)) but was not found in any file read. A repository-wide search has not been run.
-- No prompt template, model client, or retry loop exists in the repository.
+#### Paired Evaluation Guarantees:
+- **Identical Eligible Cohort:** All three strategies evaluate the identical sequence of 20 development tickets with identical indices (`0..19`).
+- **Identical Denominators:** All strategies share the exact same denominator (`N=20`).
+- **Paired Comparisons:** Computes paired deltas ($\Delta \text{strict\_accuracy}$, $\Delta \text{schema\_valid}$) and counts recovered ($0 \to 1$), regressed ($1 \to 0$), and unchanged tickets.
+
+#### Mandatory Synthetic Simulation Disclosures:
+- Persisted first responses represent historical Gemini observations.
+- Multi-turn retries evaluated via mock or synthetic response generators MUST set `is_synthetic_simulation: bool = True` and populate `simulation_note`:
+  > *"Simulated offline recovery using mock/synthetic retry generator. Must NOT be presented as observed Gemini performance."*
+- Individual ticket results record `is_simulated: bool = True` for any attempt generated synthetically.
+- Simulated retry recovery must **never** be claimed as empirical Gemini multi-turn recovery.
+
+### 10.4 Remaining Open Decisions and Gaps
+1. **Business Policy Approval:** [`docs/triage_policy.md`](triage_policy.md) v1.3 is a documentation baseline codifying existing code constants. Formal stakeholder business approval of triage rules and injection handling remains pending.
+2. **Provider and Hyperparameters for Held-Out Evaluation:** Live model selection (`gemini-3.1-flash-lite` vs `gemini-3.8-flash`), decoding parameters (temperature, top_p, seed), and rate-limit budgets must be formally frozen prior to test-set release.
+3. **Pass Threshold:** A formal statistical pass threshold must be agreed upon and justified for sample size `N=20`.
+4. **Cross-Split Duplicate Detection:** Not yet implemented; currently accepted as a known limitation.
+
+---
 
 ## 11. Document Relationships
 
-- [evaluation-baselines.md](evaluation-baselines.md): scoring rule, baseline definitions, tie-breaking, and recorded dev values.
-- This document: run specification, failure handling, configuration, metrics, and freeze criteria.
+- [`triage_policy.md`](triage_policy.md): Authoritative taxonomy, team routing mappings, and C1 policy constraints.
+- [`evaluation-baselines.md`](evaluation-baselines.md): Scoring rule, tie-breaking mechanics, and reference baseline formulas.
+- [`src/structured_output_agent/schemas.py`](../src/structured_output_agent/schemas.py): Pydantic data schemas, policy constants, and runtime validators.
