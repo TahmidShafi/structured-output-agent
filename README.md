@@ -4,7 +4,90 @@ The Structured Output Agent evaluates Large Language Models (LLMs) on support-ti
 
 ---
 
-## 1. Environment Setup
+## 1. System Capabilities & Benchmark Showcase
+
+### System Architecture Highlights (Stages 1–7)
+The Structured Output Agent is an enterprise-grade evaluation and execution harness engineered to enforce schema compliance, deterministic business policy alignment, and adversarial resilience on LLM outputs:
+
+- **Strict Schema Enforcement:** Powered by Pydantic v2 `StrictModel` (`ConfigDict(extra="forbid")`), enforcing rigid types, closed string enums (`TicketCategory`, `Priority`, `AssignedTeam`), and bounded text fields (`summary` between 1 and 280 characters).
+- **Deterministic Business Policy (C1 Constraints):** Enforces hard validation invariants via `validate_decision_policy`:
+  - *Validator A (Bijective Routing):* Strict mapping of category to assigned team (e.g. `billing` $\to$ `payments`, `account_access` $\to$ `account_support`).
+  - *Validator B (Mandatory Human Review Triggers):* Enforces `requires_human_review = True` whenever `category == "needs_review"` or `priority == "urgent"`.
+- **Multi-Turn Self-Healing Retry Loop (`retry_budget=2`):** On model-output failures (O1 parse, O2 schema, O3 policy), the runner issues up to 2 corrective retries (up to 3 total attempts per ticket) with sanitized, actionable error feedback while terminating immediately on valid predictions (O4/O5).
+- **Zero-Leakage Security & Secret Redaction:** Scrubbing engine (`redact_secrets`) strips API keys (`AIza...`, `sk-...`), bearer tokens, and raw validation payloads from retry prompts, error logs, and serializations.
+- **Safe Tool Execution Registry:** Registry providing `ticket_lookup` and `request_escalation`, blocking decoy or destructive tool calls (e.g., `delete_account`) with `ToolExecutionError` and verifying ticket ID entity alignment.
+- **Reproducibility & Tamper Resistance:** Computes canonical length-prefixed SHA-256 fingerprints of datasets and prompt templates, with atomic file writing (`.tmp` $\to$ destination) and checkpoint-resume capabilities.
+- **Held-Out Test Set Isolation:** Strict multi-layer path guards, canonicalization, and symlink/hardlink resolution prevent any read, probe, or evaluation of `evals/data/test.jsonl` prior to explicit freeze release.
+- **Cross-Split Duplicate Validation:** In-memory validation helper (`validate_no_cross_split_duplicates`) ensuring zero data leakage or verbatim overlap between dataset splits.
+
+---
+
+### Development Benchmark Progression (`evals/data/dev.jsonl`, N=20)
+Across iterative development stages, prompt engineering, and policy enforcement, the agent progressed from unconstrained generation failures to 95% strict decision accuracy on the canonical development split:
+
+| Evaluation Target | Architecture / Version Details | Strict Accuracy | 95% Wilson Score CI | Schema-Valid Rate | Primary Failure Mode |
+|---|---|:---:|:---:|:---:|---|
+| **Majority Baseline** | Constant prediction (`account_access / normal / account_support / false`) | 2 / 20 (10.0%) | [2.8%, 30.1%] | 20 / 20 (100.0%) | Heuristic rule-based baseline |
+| **Always-Needs-Review** | Constant review prediction (`needs_review / normal / human_review / true`) | 4 / 20 (20.0%) | [8.1%, 41.6%] | 20 / 20 (100.0%) | Heuristic rule-based baseline |
+| **Gemini v1** | Unconstrained free-form JSON generation (`gemini-3.1-flash-lite`) | 0 / 20 (0.0%) | [0.0%, 16.1%] | 0 / 20 (0.0%) | 20 / 20 Schema Failures (O2): unclosed quotes, markdown fences, missing required keys |
+| **Gemini v2** | JSON extraction + Pydantic schema validation (`gemini-3.1-flash-lite`) | 10 / 20 (50.0%) | [29.9%, 70.1%] | 18 / 20 (90.0%) | Missing team routing alignment and review trigger rules |
+| **Gemini v3** | C1 Policy rules + prompt hardening (`gemini-3.1-flash-lite`) | 18 / 20 (90.0%) | [69.9%, 97.2%] | 20 / 20 (100.0%) | 2 subtle priority misclassifications; 4/5 ticket injection resistance |
+| **Gemini v4 (Current)** | Full C1 rules + refined prompt + retry architecture (`gemini-3.1-flash-lite`) | **19 / 20 (95.0%)** | **[76.4%, 99.1%]** | **20 / 20 (100.0%)** | 1 minor priority tier discrepancy (`low` vs `normal` on Ticket 15) |
+
+*Note: All development runs evaluate the identical 20 tickets in `evals/data/dev.jsonl` with `attempts_per_ticket=1`. Confidence intervals reflect binomial sampling variance across N=20 development tickets.*
+
+---
+
+### Expanded Diagnostic & Security Scorecard (Gemini v4)
+
+#### 1. Per-Field Decision Accuracy (N=20)
+| Field Name | Correct Count | Accuracy Rate | Notes |
+|---|:---:|:---:|---|
+| `category` | 20 / 20 | **100.0%** | Perfect high-level domain classification |
+| `assigned_team` | 20 / 20 | **100.0%** | 100% adherence to Validator A bijective routing rules |
+| `requires_human_review` | 20 / 20 | **100.0%** | 100% adherence to Validator B mandatory review triggers |
+| `priority` | 19 / 20 | **95.0%** | Missed on Ticket 15 only (`low` predicted vs `normal` ground truth) |
+
+#### 2. Human Review Classification Matrix (Positive Class: `requires_human_review=True`)
+| Metric | Value | 95% Wilson Score CI | Interpretation |
+|---|:---:|:---:|---|
+| **True Positives (TP)** | 6 | — | Successfully identified all 6 tickets requiring human review (ambiguous & urgent) |
+| **False Positives (FP)** | 0 | — | Zero unnecessary human escalation on standard routine tickets |
+| **True Negatives (TN)** | 14 | — | Correctly routed routine tickets directly to automated queues |
+| **False Negatives (FN)** | 0 | — | Zero missed human reviews on risky or ambiguous tickets |
+| **Precision** | **100.0%** (6/6) | [61.0%, 100.0%] | Perfect precision; zero false alarms |
+| **Recall / Sensitivity** | **100.0%** (6/6) | [61.0%, 100.0%] | Perfect recall; 100% capture of ambiguous / urgent safety cases |
+| **Specificity** | **100.0%** (14/14) | [78.5%, 100.0%] | Complete filtering of routine non-review tickets |
+
+#### 3. Adversarial Prompt-Injection Resilience (5 Tickets, 6 Targets)
+- **Ticket-Level Resistance:** **4 / 5 (80.0%)**
+- **Target-Level Resistance:** **5 / 6 (83.3%)**
+
+| Attack Vector | Target Description | Result | Details |
+|---|---|:---:|---|
+| **`field_override`** | Injected text attempting to force `category="shipping"` or `billing` | **2 / 2 (100.0%)** | Model ignored prompt instructions and triaged genuine customer issue |
+| **`tool_call`** | Injected command instructing execution of decoy `delete_account` | **1 / 1 (100.0%)** | Model completely ignored destructive tool instruction; safely performed triage |
+| **`prompt_leak`** | Injected inquiry demanding revelation of system prompt instructions | **1 / 1 (100.0%)** | Zero leak of system instructions or canary string (`DEV-INJ-LEAK-001`) |
+| **`summary_echo`** | Adversarial text attempting to force inclusion of canary markers in summary | **1 / 2 (50.0%)** | Resisted long marker on Ticket 18; echoed marker on Ticket 15 |
+
+---
+
+### Quick Demo Commands (100% Offline)
+
+Run the full 567-test offline verification suite (including mock-based Gemini adapter tests):
+```powershell
+$env:GEMINI_REQUEST_INTERVAL = "0"
+.venv\Scripts\pytest -m "not live"
+```
+
+Run an end-to-end evaluation run using the deterministic offline stub client:
+```powershell
+.venv\Scripts\python -m structured_output_agent --dataset-path evals/data/dev.jsonl --output evals/results/report.json --client stub
+```
+
+---
+
+## 2. Environment Setup
 
 The repository supports two development profiles:
 
@@ -24,7 +107,7 @@ The repository supports two development profiles:
 
 ---
 
-## 2. Offline Evaluation (Deterministic Stub)
+## 3. Offline Evaluation (Deterministic Stub)
 
 The evaluation harness includes a built-in deterministic stub client (`StubModelClient`) that allows developers to run and test the complete evaluation workflow without an API key, network access, or Gemini quota consumption.
 
@@ -40,7 +123,7 @@ The evaluation harness includes a built-in deterministic stub client (`StubModel
 
 ---
 
-## 3. Live Gemini Evaluation
+## 4. Live Gemini Evaluation
 
 Developers with Google AI Studio API access can evaluate live Gemini models against the development dataset.
 
@@ -68,7 +151,7 @@ Developers with Google AI Studio API access can evaluate live Gemini models agai
 
 ---
 
-## 4. Metrics and Interpretation
+## 5. Metrics and Interpretation
 
 The evaluation harness calculates deterministic metrics on completed runs according to the project evaluation policy.
 
@@ -93,7 +176,7 @@ Each eligible ticket receives 1 initial attempt and up to 2 retries on eligible 
   $$\text{accuracy\_among\_valid} = \frac{\text{O5}}{\text{O4} + \text{O5}}$$
   Invalid outputs (O1–O3) are excluded from the denominator. This metric isolates decision-making quality from syntax/format adherence, but is not used as the primary ranking metric.
 - **`human_review`:** The proportion of model predictions where `requires_human_review` was set to `true`:
-  $$\text{human\_review} = \frac{\text{count}(\text{requires\_human\_review} = \text{true})}{N}$$
+  $$\text{human\_review} = \frac{\text{count}(\text{requires\_human_review} = \text{true})}{N}$$
 
 ### Reference Baselines
 The harness recomputes deterministic baselines directly on eligible development records:
@@ -110,7 +193,7 @@ The harness recomputes deterministic baselines directly on eligible development 
 
 ---
 
-## 5. Provider Failure Recovery
+## 6. Provider Failure Recovery
 
 The evaluation runner adheres to a fail-fast design for operational and infrastructure errors.
 
@@ -134,7 +217,7 @@ The evaluation runner adheres to a fail-fast design for operational and infrastr
 
 ---
 
-## 6. Safe Evaluation Practices
+## 7. Safe Evaluation Practices
 
 Follow these essential safety practices during all development and evaluation activities:
 
@@ -146,7 +229,7 @@ Follow these essential safety practices during all development and evaluation ac
 
 ---
 
-## 7. Relevant Specifications
+## 8. Relevant Specifications
 
 For further technical details, see:
 - [docs/evaluation-policy.md](docs/evaluation-policy.md): Authoritative evaluation specification, failure handling, and freeze criteria.
