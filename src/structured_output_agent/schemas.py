@@ -7,6 +7,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictInt,
     StringConstraints,
     ValidationError,
     model_validator,
@@ -54,6 +55,40 @@ class StrictModel(BaseModel):
     """Reject unexpected fields in every derived model."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class RatioMetric(StrictModel):
+    """Represents a count, total denominator, and optional rate.
+
+    Rate is float in [0.0, 1.0] when total > 0, and None when total == 0.
+    """
+
+    count: StrictInt = Field(ge=0)
+    total: StrictInt = Field(ge=0)
+    rate: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_rate(self) -> "RatioMetric":
+        if self.total == 0:
+            if self.rate is not None:
+                raise ValueError("rate must be None when total is 0.")
+            if self.count != 0:
+                raise ValueError("count must be 0 when total is 0.")
+        else:
+            if self.rate is None:
+                raise ValueError("rate must be provided when total > 0.")
+            expected = self.count / self.total
+            if abs(self.rate - expected) > 1e-6:
+                raise ValueError(
+                    f"rate {self.rate} does not match {self.count} / {self.total}."
+                )
+        return self
+
+
+def make_ratio(count: int, total: int) -> RatioMetric:
+    """Construct RatioMetric, setting rate to None if total is 0."""
+    rate = count / total if total > 0 else None
+    return RatioMetric(count=count, total=total, rate=rate)
 
 
 # Ticket classification values

@@ -6,11 +6,14 @@ from pydantic import ValidationError
 from structured_output_agent.dataset_io import load_dataset
 from structured_output_agent.metrics import (
     BaselineResult,
+    ConfidenceInterval,
     EvaluationMetrics,
     OutcomeBreakdown,
     RatioMetric,
     compute_metrics,
+    make_confidence_interval,
     make_ratio,
+    wilson_score_interval,
 )
 from structured_output_agent.run_config import RunConfig
 from structured_output_agent.run_results import RunOutcome, TicketRunResult
@@ -730,5 +733,542 @@ def test_metrics_rejects_accuracy_among_valid_count_inconsistent() -> None:
     data["accuracy_among_valid"] = make_ratio(0, 2)
     with pytest.raises(ValidationError, match="accuracy_among_valid count"):
         EvaluationMetrics(**data)
+
+
+def test_wilson_score_interval_properties_and_edge_cases() -> None:
+    # 0 observations returns (None, None)
+    assert wilson_score_interval(0, 0) == (None, None)
+
+    # 0 successes: lower is strictly 0.0, upper matches formula
+    low_0, up_0 = wilson_score_interval(0, 10)
+    assert low_0 == 0.0
+    assert up_0 == pytest.approx(0.27753, abs=1e-4)
+
+    # All successes: lower matches formula, upper is strictly 1.0
+    low_10, up_10 = wilson_score_interval(10, 10)
+    assert low_10 == pytest.approx(0.72246, abs=1e-4)
+    assert up_10 == 1.0
+
+    # Partial success: symmetric around 0.5
+    low_5, up_5 = wilson_score_interval(5, 10)
+    assert low_5 == pytest.approx(0.23659, abs=1e-4)
+    assert up_5 == pytest.approx(0.76340, abs=1e-4)
+    assert (low_5 + up_5) == pytest.approx(1.0)
+
+    # Custom confidence levels
+    low_90, up_90 = wilson_score_interval(5, 10, confidence_level=0.90)
+    low_99, up_99 = wilson_score_interval(5, 10, confidence_level=0.99)
+    # Higher confidence -> wider interval
+    assert low_99 < low_90 < 0.5 < up_90 < up_99
+
+    # Input validation
+    with pytest.raises(ValueError, match="Invalid binomial counts"):
+        wilson_score_interval(-1, 10)
+    with pytest.raises(ValueError, match="Invalid binomial counts"):
+        wilson_score_interval(11, 10)
+    with pytest.raises(ValueError, match="Invalid binomial counts"):
+        wilson_score_interval(0, -5)
+    with pytest.raises(
+        ValueError, match="confidence_level must be strictly between 0 and 1"
+    ):
+        wilson_score_interval(5, 10, confidence_level=0.0)
+    with pytest.raises(
+        ValueError, match="confidence_level must be strictly between 0 and 1"
+    ):
+        wilson_score_interval(5, 10, confidence_level=1.0)
+
+    # ConfidenceInterval model
+    ci = make_confidence_interval(5, 10)
+    assert ci.lower == pytest.approx(0.23659, abs=1e-4)
+    assert ci.upper == pytest.approx(0.76340, abs=1e-4)
+    assert ci.confidence_level == 0.95
+
+    # Empty ConfidenceInterval
+    ci_empty = make_confidence_interval(0, 0)
+    assert ci_empty.lower is None
+    assert ci_empty.upper is None
+
+    # Invalid ConfidenceInterval bounds
+    with pytest.raises(ValueError, match="cannot exceed upper bound"):
+        ConfidenceInterval(lower=0.8, upper=0.2)
+    with pytest.raises(ValueError, match="both be None or both be floats"):
+        ConfidenceInterval(lower=0.2, upper=None)
+
+
+def test_schema_valid_rate_across_outcomes() -> None:
+    records = [_make_record(i) for i in range(5)]
+    valid_pred = _make_prediction()
+    results = [
+        # O1 parse failure (schema-invalid)
+        TicketRunResult(
+            ticket_index=0,
+            outcome=RunOutcome.EXTRACTION_FAILURE,
+            credit=0,
+            error_type="JSONExtractionError",
+            error_message="Fail",
+        ),
+        # O2 schema failure (schema-invalid)
+        TicketRunResult(
+            ticket_index=1,
+            outcome=RunOutcome.SCHEMA_FAILURE,
+            credit=0,
+            error_type="ValidationError",
+            error_message="Field missing",
+        ),
+        # O3 policy failure (schema-valid: parsed and conformed to TicketTriageOutput)
+        TicketRunResult(
+            ticket_index=2,
+            outcome=RunOutcome.POLICY_FAILURE,
+            credit=0,
+            error_type="ValueError",
+            error_message="Policy violation",
+            prediction=valid_pred,
+        ),
+        # O4 valid incorrect (schema-valid)
+        TicketRunResult(
+            ticket_index=3,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(
+                category=TicketCategory.OTHER, team=AssignedTeam.GENERAL_SUPPORT
+            ),
+        ),
+        # O5 valid correct (schema-valid)
+        TicketRunResult(
+            ticket_index=4,
+            outcome=RunOutcome.VALID_CORRECT,
+            credit=1,
+            prediction=valid_pred,
+        ),
+    ]
+    run = EvaluationRun(
+        config=RunConfig(),
+        status=RunStatus.COMPLETED,
+        eligible_count=5,
+        dataset_fingerprint=compute_dataset_fingerprint(records),
+        completed_results=results,
+    )
+    metrics = compute_metrics(run, records)
+
+    assert metrics.schema_valid is not None
+    assert metrics.schema_valid.count == 3  # O3 + O4 + O5
+    assert metrics.schema_valid.total == 5
+    assert metrics.schema_valid.rate == pytest.approx(0.60)
+
+    # Check Wilson interval for schema_valid
+    assert metrics.confidence_intervals is not None
+    ci_schema = metrics.confidence_intervals["schema_valid"]
+    assert ci_schema.lower is not None and ci_schema.upper is not None
+    assert ci_schema.lower < 0.60 < ci_schema.upper
+
+
+def test_field_accuracy_perfect_and_isolated_field_errors() -> None:
+    # 5 tickets where expected is BILLING, NORMAL, PAYMENTS, False
+    records = [_make_record(i) for i in range(5)]
+    results = [
+        # 0: Perfect
+        TicketRunResult(
+            ticket_index=0,
+            outcome=RunOutcome.VALID_CORRECT,
+            credit=1,
+            prediction=_make_prediction(
+                category=TicketCategory.BILLING,
+                priority=Priority.NORMAL,
+                team=AssignedTeam.PAYMENTS,
+                requires_human_review=False,
+            ),
+        ),
+        # 1: Priority wrong only (HIGH instead of NORMAL)
+        TicketRunResult(
+            ticket_index=1,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(
+                category=TicketCategory.BILLING,
+                priority=Priority.HIGH,
+                team=AssignedTeam.PAYMENTS,
+                requires_human_review=False,
+            ),
+        ),
+        # 2: Category and Team wrong (SHIPPING and FULFILLMENT)
+        TicketRunResult(
+            ticket_index=2,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(
+                category=TicketCategory.SHIPPING,
+                priority=Priority.NORMAL,
+                team=AssignedTeam.FULFILLMENT,
+                requires_human_review=False,
+            ),
+        ),
+        # 3: requires_human_review wrong only (True instead of False)
+        TicketRunResult(
+            ticket_index=3,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(
+                category=TicketCategory.BILLING,
+                priority=Priority.NORMAL,
+                team=AssignedTeam.PAYMENTS,
+                requires_human_review=True,
+            ),
+        ),
+        # 4: Extraction failure (no prediction, 0 credit across all fields)
+        TicketRunResult(
+            ticket_index=4,
+            outcome=RunOutcome.EXTRACTION_FAILURE,
+            credit=0,
+            error_type="JSONExtractionError",
+            error_message="Fail",
+        ),
+    ]
+    run = EvaluationRun(
+        config=RunConfig(),
+        status=RunStatus.COMPLETED,
+        eligible_count=5,
+        dataset_fingerprint=compute_dataset_fingerprint(records),
+        completed_results=results,
+    )
+    metrics = compute_metrics(run, records)
+
+    assert metrics.field_accuracy is not None
+    # Category: correct on 0, 1, 3 -> 3 / 5 (60%)
+    assert metrics.field_accuracy.category.count == 3
+    assert metrics.field_accuracy.category.total == 5
+    assert metrics.field_accuracy.category.rate == pytest.approx(0.60)
+
+    # Priority: correct on 0, 2, 3 -> 3 / 5 (60%)
+    assert metrics.field_accuracy.priority.count == 3
+    assert metrics.field_accuracy.priority.total == 5
+    assert metrics.field_accuracy.priority.rate == pytest.approx(0.60)
+
+    # Assigned team: correct on 0, 1, 3 -> 3 / 5 (60%)
+    assert metrics.field_accuracy.assigned_team.count == 3
+    assert metrics.field_accuracy.assigned_team.total == 5
+    assert metrics.field_accuracy.assigned_team.rate == pytest.approx(0.60)
+
+    # requires_human_review: correct on 0, 1, 2 -> 3 / 5 (60%)
+    assert metrics.field_accuracy.requires_human_review.count == 3
+    assert metrics.field_accuracy.requires_human_review.total == 5
+    assert metrics.field_accuracy.requires_human_review.rate == pytest.approx(0.60)
+
+
+def test_field_accuracy_ambiguous_two_accepted_decisions() -> None:
+    # Ambiguous record accepts both NORMAL and HIGH priorities
+    record = _make_record(0, tags={DatasetTag.AMBIGUOUS})
+    pred_high = _make_prediction(
+        category=TicketCategory.NEEDS_REVIEW,
+        priority=Priority.HIGH,
+        team=AssignedTeam.HUMAN_REVIEW,
+        requires_human_review=True,
+    )
+    run = EvaluationRun(
+        config=RunConfig(),
+        status=RunStatus.COMPLETED,
+        eligible_count=1,
+        dataset_fingerprint=compute_dataset_fingerprint([record]),
+        completed_results=[
+            TicketRunResult(
+                ticket_index=0,
+                outcome=RunOutcome.VALID_CORRECT,
+                credit=1,
+                prediction=pred_high,
+            )
+        ],
+    )
+    metrics = compute_metrics(run, [record])
+    assert metrics.field_accuracy is not None
+    assert metrics.field_accuracy.priority.count == 1
+    assert metrics.field_accuracy.priority.rate == pytest.approx(1.0)
+
+
+def test_human_review_confusion_matrix_and_ratios() -> None:
+    # 5 records: 0: TP, 1: FP, 2: TN, 3: FN, 4: unclassified (parse failure)
+    records = [
+        _make_record(0, requires_human_review=True),
+        _make_record(1, requires_human_review=False),
+        _make_record(2, requires_human_review=False),
+        _make_record(3, requires_human_review=True),
+        _make_record(4, requires_human_review=False),
+    ]
+    results = [
+        # 0: pred=True, exp=True -> TP
+        TicketRunResult(
+            ticket_index=0,
+            outcome=RunOutcome.VALID_CORRECT,
+            credit=1,
+            prediction=_make_prediction(requires_human_review=True),
+        ),
+        # 1: pred=True, exp=False -> FP
+        TicketRunResult(
+            ticket_index=1,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(requires_human_review=True),
+        ),
+        # 2: pred=False, exp=False -> TN
+        TicketRunResult(
+            ticket_index=2,
+            outcome=RunOutcome.VALID_CORRECT,
+            credit=1,
+            prediction=_make_prediction(requires_human_review=False),
+        ),
+        # 3: pred=False, exp=True -> FN
+        TicketRunResult(
+            ticket_index=3,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(requires_human_review=False),
+        ),
+        # 4: Extraction failure -> unclassified
+        TicketRunResult(
+            ticket_index=4,
+            outcome=RunOutcome.EXTRACTION_FAILURE,
+            credit=0,
+            error_type="JSONExtractionError",
+            error_message="Fail",
+        ),
+    ]
+    run = EvaluationRun(
+        config=RunConfig(),
+        status=RunStatus.COMPLETED,
+        eligible_count=5,
+        dataset_fingerprint=compute_dataset_fingerprint(records),
+        completed_results=results,
+    )
+    metrics = compute_metrics(run, records)
+
+    assert metrics.human_review_metrics is not None
+    cm = metrics.human_review_metrics.confusion_matrix
+    assert cm.true_positives == 1
+    assert cm.false_positives == 1
+    assert cm.true_negatives == 1
+    assert cm.false_negatives == 1
+    assert cm.unclassified == 1
+
+    # Precision = TP / (TP + FP) = 1 / 2
+    assert metrics.human_review_metrics.precision.count == 1
+    assert metrics.human_review_metrics.precision.total == 2
+    assert metrics.human_review_metrics.precision.rate == pytest.approx(0.50)
+
+    # Recall = TP / (TP + FN) = 1 / 2
+    assert metrics.human_review_metrics.recall.count == 1
+    assert metrics.human_review_metrics.recall.total == 2
+    assert metrics.human_review_metrics.recall.rate == pytest.approx(0.50)
+
+    # Specificity = TN / (TN + FP) = 1 / 2
+    assert metrics.human_review_metrics.specificity.count == 1
+    assert metrics.human_review_metrics.specificity.total == 2
+    assert metrics.human_review_metrics.specificity.rate == pytest.approx(0.50)
+
+
+def test_human_review_zero_denominators() -> None:
+    records = [_make_record(0, requires_human_review=False)]
+    results = [
+        TicketRunResult(
+            ticket_index=0,
+            outcome=RunOutcome.VALID_CORRECT,
+            credit=1,
+            prediction=_make_prediction(requires_human_review=False),
+        )
+    ]
+    run = EvaluationRun(
+        config=RunConfig(),
+        status=RunStatus.COMPLETED,
+        eligible_count=1,
+        dataset_fingerprint=compute_dataset_fingerprint(records),
+        completed_results=results,
+    )
+    metrics = compute_metrics(run, records)
+
+    assert metrics.human_review_metrics is not None
+    cm = metrics.human_review_metrics.confusion_matrix
+    assert cm.true_positives == 0
+    assert cm.false_positives == 0
+    assert cm.true_negatives == 1
+    assert cm.false_negatives == 0
+    assert cm.unclassified == 0
+
+    # Precision: TP + FP = 0 -> rate is None
+    assert metrics.human_review_metrics.precision.total == 0
+    assert metrics.human_review_metrics.precision.rate is None
+
+    # Recall: TP + FN = 0 -> rate is None
+    assert metrics.human_review_metrics.recall.total == 0
+    assert metrics.human_review_metrics.recall.rate is None
+
+    # Specificity: TN / (TN + FP) = 1 / 1 = 1.0
+    assert metrics.human_review_metrics.specificity.total == 1
+    assert metrics.human_review_metrics.specificity.rate == pytest.approx(1.0)
+
+
+def test_over_and_under_escalation_metrics() -> None:
+    # 4 tickets:
+    # 0: expected LOW, predicted NORMAL -> prio_over
+    # 1: expected HIGH, predicted NORMAL -> prio_under
+    # 2: expected NORMAL, predicted URGENT -> urg_over (and prio_over)
+    # 3: expected URGENT, predicted NORMAL -> urg_under (and prio_under)
+    records = [
+        _make_record(0, priority=Priority.LOW),
+        _make_record(1, priority=Priority.HIGH),
+        _make_record(2, priority=Priority.NORMAL),
+        _make_record(3, priority=Priority.URGENT, requires_human_review=True),
+    ]
+    results = [
+        # 0: pred=NORMAL, exp=LOW -> over-priority
+        TicketRunResult(
+            ticket_index=0,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(priority=Priority.NORMAL),
+        ),
+        # 1: pred=NORMAL, exp=HIGH -> under-priority
+        TicketRunResult(
+            ticket_index=1,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(priority=Priority.NORMAL),
+        ),
+        # 2: pred=URGENT, exp=NORMAL -> over-urgent, over-priority
+        TicketRunResult(
+            ticket_index=2,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(
+                priority=Priority.URGENT, requires_human_review=True
+            ),
+        ),
+        # 3: pred=NORMAL, exp=URGENT -> under-urgent, under-priority
+        TicketRunResult(
+            ticket_index=3,
+            outcome=RunOutcome.VALID_INCORRECT,
+            credit=0,
+            prediction=_make_prediction(
+                priority=Priority.NORMAL, requires_human_review=False
+            ),
+        ),
+    ]
+    run = EvaluationRun(
+        config=RunConfig(),
+        status=RunStatus.COMPLETED,
+        eligible_count=4,
+        dataset_fingerprint=compute_dataset_fingerprint(records),
+        completed_results=results,
+    )
+    metrics = compute_metrics(run, records)
+
+    assert metrics.escalation_metrics is not None
+    # prio_over on tickets 0 and 2 -> 2/4
+    assert metrics.escalation_metrics.priority_over_escalation.count == 2
+    assert metrics.escalation_metrics.priority_over_escalation.total == 4
+    assert metrics.escalation_metrics.priority_over_escalation.rate == pytest.approx(
+        0.50
+    )
+
+    # prio_under on tickets 1 and 3 -> 2/4
+    assert metrics.escalation_metrics.priority_under_escalation.count == 2
+    assert metrics.escalation_metrics.priority_under_escalation.total == 4
+    assert metrics.escalation_metrics.priority_under_escalation.rate == pytest.approx(
+        0.50
+    )
+
+    # urg_over on ticket 2 -> 1/4
+    assert metrics.escalation_metrics.urgent_over_escalation.count == 1
+    assert metrics.escalation_metrics.urgent_over_escalation.total == 4
+    assert metrics.escalation_metrics.urgent_over_escalation.rate == pytest.approx(
+        0.25
+    )
+
+    # urg_under on ticket 3 -> 1/4
+    assert metrics.escalation_metrics.urgent_under_escalation.count == 1
+    assert metrics.escalation_metrics.urgent_under_escalation.total == 4
+    assert metrics.escalation_metrics.urgent_under_escalation.rate == pytest.approx(
+        0.25
+    )
+
+    # Limitation note is present and documents distinction from human review
+    assert (
+        "authoritative escalation field"
+        in metrics.escalation_metrics.limitation_note
+    )
+    assert (
+        "not equated with escalation"
+        in metrics.escalation_metrics.limitation_note
+    )
+
+
+def test_injection_resilience_metric_integration() -> None:
+    records = [
+        _make_record(0, tags={DatasetTag.CLEAN}),
+        _make_record(1, tags={DatasetTag.INJECTION}),
+    ]
+    results = [
+        TicketRunResult(
+            ticket_index=0,
+            outcome=RunOutcome.VALID_CORRECT,
+            credit=1,
+            prediction=_make_prediction(),
+        ),
+        TicketRunResult(
+            ticket_index=1,
+            outcome=RunOutcome.VALID_CORRECT,
+            credit=1,
+            prediction=_make_prediction(),
+            raw_response="Clean response without echoed marker",
+        ),
+    ]
+    run = EvaluationRun(
+        config=RunConfig(),
+        status=RunStatus.COMPLETED,
+        eligible_count=2,
+        dataset_fingerprint=compute_dataset_fingerprint(records),
+        completed_results=results,
+    )
+    metrics = compute_metrics(run, records)
+
+    assert metrics.injection is not None
+    assert metrics.injection.eligible_count == 2
+    assert metrics.injection.injection_ticket_count == 1
+    assert metrics.injection.tickets_resisted.count == 1
+    assert metrics.injection.tickets_resisted.total == 1
+    assert metrics.injection.tickets_resisted.rate == pytest.approx(1.0)
+    assert metrics.injection.targets_resisted.count == 1
+    assert metrics.injection.targets_resisted.total == 1
+    assert metrics.injection.targets_resisted.rate == pytest.approx(1.0)
+    assert "summary_echo" in metrics.injection.per_kind
+    assert metrics.injection.per_kind["summary_echo"].rate == pytest.approx(1.0)
+
+
+def test_report_serialization_and_backward_compatibility() -> None:
+    from structured_output_agent.reporting import EvaluationReport, generate_report
+
+    records = [_make_record(0)]
+    run = EvaluationRun(
+        config=RunConfig(),
+        status=RunStatus.COMPLETED,
+        eligible_count=1,
+        dataset_fingerprint=compute_dataset_fingerprint(records),
+        completed_results=[
+            TicketRunResult(
+                ticket_index=0,
+                outcome=RunOutcome.VALID_CORRECT,
+                credit=1,
+                prediction=_make_prediction(),
+            )
+        ],
+    )
+    report = generate_report(run, records)
+    json_str = report.to_json()
+    reconstructed = EvaluationReport.from_json(json_str)
+
+    assert reconstructed == report
+    assert reconstructed.metrics.schema_valid is not None
+    assert reconstructed.metrics.schema_valid.count == 1
+    assert reconstructed.metrics.field_accuracy is not None
+    assert reconstructed.metrics.human_review_metrics is not None
+    assert reconstructed.metrics.escalation_metrics is not None
+    assert reconstructed.metrics.confidence_intervals is not None
+
 
 

@@ -46,6 +46,9 @@ class TicketRunResult(StrictModel):
     error_type: str | None = None
     error_message: str | None = None
     prediction: TicketTriageOutput | None = None
+    raw_response: str | None = None
+    attempts: StrictInt = Field(default=1, ge=1)
+    raw_responses: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def check_consistency(self) -> "TicketRunResult":
@@ -65,6 +68,11 @@ class TicketRunResult(StrictModel):
                 "prediction is absent only for extraction and schema failures."
             )
 
+        if not self.raw_responses and self.raw_response is not None:
+            self.raw_responses = [self.raw_response]
+        elif self.raw_responses and self.raw_response is None:
+            self.raw_response = self.raw_responses[-1]
+
         return self
 
 
@@ -73,7 +81,11 @@ def _failed(
     outcome: RunOutcome,
     error: Exception,
     prediction: TicketTriageOutput | None = None,
+    raw_response: str | None = None,
+    attempts: int = 1,
+    raw_responses: list[str] | None = None,
 ) -> TicketRunResult:
+    responses = raw_responses or ([raw_response] if raw_response is not None else [])
     return TicketRunResult(
         ticket_index=ticket_index,
         outcome=outcome,
@@ -81,6 +93,9 @@ def _failed(
         error_type=type(error).__name__,
         error_message=str(error),
         prediction=prediction,
+        raw_response=raw_response,
+        attempts=attempts,
+        raw_responses=responses,
     )
 
 
@@ -88,16 +103,34 @@ def classify_response(
     raw: str,
     record: DatasetRecord,
     ticket_index: int,
+    *,
+    attempts: int = 1,
+    raw_responses: list[str] | None = None,
 ) -> TicketRunResult:
+    all_responses = raw_responses or ([raw] if raw is not None else [])
     try:
         payload = extract_json_object(raw)
     except JSONExtractionError as error:
-        return _failed(ticket_index, RunOutcome.EXTRACTION_FAILURE, error)
+        return _failed(
+            ticket_index,
+            RunOutcome.EXTRACTION_FAILURE,
+            error,
+            raw_response=raw,
+            attempts=attempts,
+            raw_responses=all_responses,
+        )
 
     try:
         prediction = TicketTriageOutput.model_validate(payload)
     except ValidationError as error:
-        return _failed(ticket_index, RunOutcome.SCHEMA_FAILURE, error)
+        return _failed(
+            ticket_index,
+            RunOutcome.SCHEMA_FAILURE,
+            error,
+            raw_response=raw,
+            attempts=attempts,
+            raw_responses=all_responses,
+        )
 
     try:
         validate_decision_policy(prediction)
@@ -107,6 +140,9 @@ def classify_response(
             RunOutcome.POLICY_FAILURE,
             error,
             prediction=prediction,
+            raw_response=raw,
+            attempts=attempts,
+            raw_responses=all_responses,
         )
 
     decision = ExpectedDecision(
@@ -124,4 +160,7 @@ def classify_response(
         ),
         credit=1 if is_correct else 0,
         prediction=prediction,
+        raw_response=raw,
+        attempts=attempts,
+        raw_responses=all_responses,
     )

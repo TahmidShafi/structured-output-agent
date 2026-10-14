@@ -359,3 +359,36 @@ def test_unexpected_scorer_error_propagates_without_model_outcome(
 
     with pytest.raises(RuntimeError, match="scorer failure"):
         classify_response(response(), make_record(decision()), 0)
+
+
+def test_classify_response_preserves_raw_response_on_success() -> None:
+    raw = response()
+    result = classify_response(raw, make_record(decision()), 0)
+    assert result.raw_response == raw
+
+
+def test_classify_response_preserves_raw_response_on_extraction_failure() -> None:
+    raw = "unparseable response text"
+    result = classify_response(raw, make_record(decision()), 0)
+    assert result.raw_response == raw
+
+
+def test_classify_response_preserves_raw_response_on_schema_failure() -> None:
+    raw = json.dumps({"invalid": "schema"})
+    result = classify_response(raw, make_record(decision()), 0)
+    assert result.raw_response == raw
+
+
+def test_classify_response_preserves_raw_response_on_policy_failure() -> None:
+    raw = json.dumps(
+        {
+            "category": "needs_review",
+            "priority": "normal",
+            "assigned_team": "human_review",
+            "summary": "Customer inquiry",
+            "requires_human_review": False,
+        }
+    )
+    result = classify_response(raw, make_record(decision()), 0)
+    assert result.raw_response == raw
+
