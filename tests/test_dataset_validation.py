@@ -5,6 +5,7 @@ from structured_output_agent.dataset_validation import (
     validate_category_priority_coverage,
     validate_dataset_integrity,
     validate_long_ticket_tags,
+    validate_no_cross_split_duplicates,
     validate_unique_injection_markers,
     validate_unique_tickets,
 )
@@ -367,3 +368,56 @@ def test_multiple_targets_on_one_record_are_supported():
     )
 
     validate_unique_injection_markers([record])
+
+
+def test_cross_split_distinct_tickets_are_accepted():
+    split_dev = [
+        make_record(input_text="Dev ticket one"),
+        make_record(input_text="Dev ticket two"),
+    ]
+    split_test = [
+        make_record(input_text="Test ticket one"),
+        make_record(input_text="Test ticket two"),
+    ]
+
+    validate_no_cross_split_duplicates(
+        split_dev, split_test, split_a_name="dev", split_b_name="test"
+    )
+
+
+def test_cross_split_exact_duplicate_is_rejected():
+    split_dev = [
+        make_record(input_text="Shared ticket text"),
+        make_record(input_text="Dev ticket two"),
+    ]
+    split_test = [
+        make_record(input_text="Test ticket one"),
+        make_record(input_text="Shared ticket text"),
+    ]
+
+    with pytest.raises(
+        ValueError, match="Cross-split duplicate ticket input detected"
+    ):
+        validate_no_cross_split_duplicates(
+            split_dev, split_test, split_a_name="dev", split_b_name="test"
+        )
+
+
+def test_cross_split_whitespace_case_duplicate_is_rejected():
+    split_dev = [
+        make_record(input_text="I was charged twice."),
+    ]
+    split_test = [
+        make_record(input_text="  i WAS   charged twice.  "),
+    ]
+
+    with pytest.raises(
+        ValueError, match=r"between dev \(index 0\) and test \(index 0\)"
+    ):
+        validate_no_cross_split_duplicates(
+            split_dev, split_test, split_a_name="dev", split_b_name="test"
+        )
+
+
+def test_cross_split_empty_splits_are_accepted():
+    validate_no_cross_split_duplicates([], [])

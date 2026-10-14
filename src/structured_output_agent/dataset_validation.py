@@ -30,6 +30,37 @@ def validate_unique_tickets(
         seen[normalized] = index
 
 
+def validate_no_cross_split_duplicates(
+    split_a_records: Sequence[DatasetRecord],
+    split_b_records: Sequence[DatasetRecord],
+    *,
+    split_a_name: str = "split_a",
+    split_b_name: str = "split_b",
+) -> None:
+    """Ensure no duplicate ticket inputs exist across two dataset splits.
+
+    Normalizes ticket text identically to validate_unique_tickets to detect exact,
+    case-insensitive, and whitespace-variant duplicates between the two record sets.
+    Raises ValueError on the first detected duplicate with clear split names and
+    indexes.
+    """
+    seen: dict[str, int] = {}
+    for index, record in enumerate(split_a_records):
+        normalized = _normalize_ticket_text(record.input)
+        if normalized not in seen:
+            seen[normalized] = index
+
+    for index, record in enumerate(split_b_records):
+        normalized = _normalize_ticket_text(record.input)
+        if normalized in seen:
+            first_index = seen[normalized]
+            raise ValueError(
+                f"Cross-split duplicate ticket input detected between "
+                f"{split_a_name} (index {first_index}) and "
+                f"{split_b_name} (index {index})."
+            )
+
+
 def validate_unique_injection_markers(
     records: Sequence[DatasetRecord],
 ) -> None:

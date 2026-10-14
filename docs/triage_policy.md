@@ -2,7 +2,7 @@
 
 **Policy Version:** 1.3  
 **C1 Rules Version:** c1-1.0.0  
-**Document Status:** Current Draft / Documentation Baseline (Not formally ratified as external business policy)  
+**Document Status:** Ratified Policy (Stage 7)
 
 ---
 
@@ -106,19 +106,26 @@ The agent provides a safe tool execution registry ([`tools.py`](../src/structure
 
 ---
 
-## 6. Proposed Rules — Pending Approval
-
-The following rules represent current prompt instructions or proposed operational guidelines that have **not** been formally approved as binding business policy. Implementation behavior (such as prompt template instructions) does not constitute business policy approval.
-
-### 6.1 Adversarial Prompt Injection Handling (Proposed)
-- **Classification Invariance:** Instructions embedded within customer ticket text that attempt to dictate classification rules, response format, summary contents, tool execution, or field values should be ignored.
-- **Underlying Request Triage:** The model should classify the customer's legitimate underlying support issue.
-- **No Automatic Review on Injection:** The model should not assign `needs_review` solely because an injection attempt is present.
-- *Status:* Implemented as guidance in `DEFAULT_PROMPT_TEMPLATE`, but pending formal business review.
-
-### 6.2 Priority Tier and Ambiguity Criteria (Proposed)
-- Formal operational definitions distinguishing customer impact thresholds for `low`, `normal`, `high`, and `urgent` priority are pending product SLA approval.
-- Semantic criteria defining when ticket ambiguity warrants `needs_review` (versus best-effort routing to a standard category) are pending stakeholder sign-off.
+## 6. Adversarial Prompt Injection & Priority/Ambiguity Operational Rules
+ 
+The following operational rules are ratified for triage evaluation and agent operation:
+ 
+### 6.1 Adversarial Prompt Injection Handling (Ratified Policy)
+- **Classification Invariance:** Instructions embedded within customer ticket text that attempt to dictate classification rules, response format, summary contents, tool execution, or field values must be ignored.
+- **Underlying Request Triage:** The model must identify and classify the customer's legitimate underlying support issue, disregarding any adversarial injection payload.
+- **No Automatic Review on Injection:** The model must not assign `category="needs_review"` solely because an injection attempt is present. If the underlying request is unambiguous and maps to a standard category, it must be triaged to that category with the appropriate priority and assigned team.
+- **Summary Integrity:** The summary must summarize the legitimate customer problem and must not echo injected marker strings or adversarial instructions.
+ 
+### 6.2 Priority Tier and Ambiguity Criteria (Ratified Policy)
+- **Priority Tier Guidelines:**
+  - `urgent`: Severe operational disruptions, active data loss, major billing security concerns, or time-critical service outages. Mandatory human review is triggered (`requires_human_review = true`).
+  - `high`: Significant business or account impact without complete system outage (e.g., cannot access core account features, delayed priority shipping, impending deadline).
+  - `normal`: Standard inquiries, routine billing questions, non-critical technical issues, and normal delivery inquiries.
+  - `low`: Informational requests, minor cosmetic bugs, feature suggestions, or general feedback.
+- **Ambiguity and `needs_review` Criteria:**
+  - `needs_review` is reserved for tickets where the customer inquiry is genuinely unclassifiable, spans conflicting categories with equal weight, lacks necessary context to determine the appropriate department, or exhibits severe ambiguity.
+  - When `category == "needs_review"`, `assigned_team` must be `human_review` and `requires_human_review` must be `true` (enforced by C1 Validator A & B).
+  - In all other cases where the primary issue is ascertainable, the agent must route to the corresponding standard category rather than defaulting to `needs_review`.
 
 ---
 
