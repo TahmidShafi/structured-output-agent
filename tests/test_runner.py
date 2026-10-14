@@ -736,7 +736,7 @@ def test_model_output_failures_do_not_abort_run_and_preserve_denominator(
     responses.extend([_valid_billing_json()] * 8)
 
     client = _StubClient(responses)
-    config = RunConfig(dataset_path=dataset_path)
+    config = RunConfig(dataset_path=dataset_path, retry_budget=0)
 
     run = run_evaluation(config, client)
 

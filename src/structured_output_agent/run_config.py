@@ -4,13 +4,14 @@ import stat
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import field_serializer, field_validator
+from pydantic import Field, field_serializer, field_validator
 
 from .schemas import DatasetSplit, StrictModel
 
 DEFAULT_DATASET_PATH = Path("evals/data/dev.jsonl")
 DEFAULT_EXTRACTOR = "extract_json_object"
 DEFAULT_ATTEMPTS_PER_TICKET = 1
+DEFAULT_RETRY_BUDGET = 2
 PROTECTED_DATASET_NAME = "test.jsonl"
 
 
@@ -58,14 +59,26 @@ def _is_protected_component(comp: str) -> bool:
 class RunConfig(StrictModel):
     """Typed configuration for an evaluation run.
 
-    Enforces development-only evaluation, single-attempt execution,
-    and deterministic JSON serialization/reconstruction.
+    Enforces development-only evaluation, single-attempt initial execution,
+    configurable retry budget for eligible model failures, and deterministic
+    JSON serialization/reconstruction.
     """
 
     dataset_path: Path = DEFAULT_DATASET_PATH
     split: DatasetSplit = DatasetSplit.DEV
     extractor: Literal["extract_json_object"] = DEFAULT_EXTRACTOR
     attempts_per_ticket: Literal[1] = DEFAULT_ATTEMPTS_PER_TICKET
+    retry_budget: int = Field(
+        default=DEFAULT_RETRY_BUDGET,
+        ge=0,
+        description=(
+            "Configurable retry budget for eligible failures (O1-O3). "
+            "Under the agreed project interpretation, retry_budget=2 specifies "
+            "that up to 2 retries are allowed following the initial attempt "
+            "(up to 3 total attempts per ticket)."
+        ),
+    )
+    failure_log_path: Path | None = None
 
     @field_validator("split")
     @classmethod
@@ -190,9 +203,28 @@ class RunConfig(StrictModel):
 
         return Path(raw)
 
+    @field_validator("failure_log_path")
+    @classmethod
+    def validate_failure_log_path(cls, value: Path | str | None) -> Path | None:
+        if value is None:
+            return None
+        raw = str(value).strip().replace("\\", "/")
+        if not raw:
+            return None
+        pure = PurePosixPath(raw)
+        if any(_is_protected_component(part) for part in pure.parts):
+            raise ValueError(
+                f"failure_log_path cannot target the protected test dataset: {raw!r}."
+            )
+        return Path(raw)
+
     @field_serializer("dataset_path", when_used="json")
     def serialize_dataset_path(self, value: Path) -> str:
         return value.as_posix()
+
+    @field_serializer("failure_log_path", when_used="json")
+    def serialize_failure_log_path(self, value: Path | None) -> str | None:
+        return value.as_posix() if value is not None else None
 
     def to_json(self, *, indent: int | None = 2) -> str:
         """Serialize configuration to a deterministic JSON string."""

@@ -12,9 +12,11 @@ from .checkpoint import EvaluationCheckpoint
 from .dataset_io import load_dataset
 from .dataset_validation import validate_dataset_integrity
 from .exceptions import AgentError, OperationalError
+from .failure_logger import append_failure_log, create_failure_log_entry
+from .feedback import generate_actionable_feedback
 from .model_client import ModelClient, resolve_client_provenance
 from .run_config import RunConfig
-from .run_results import TicketRunResult, classify_response
+from .run_results import FAILURE_OUTCOMES, TicketRunResult, classify_response
 from .schemas import DatasetRecord, StrictModel
 
 PromptBuilder = Callable[[DatasetRecord], str]
@@ -265,6 +267,8 @@ def run_evaluation(
     checkpoint_path: Path | str | None = None,
     resume: bool = False,
     report_path: Path | str | None = None,
+    retry_budget: int | None = None,
+    failure_log_path: Path | str | None = None,
 ) -> EvaluationRun:
     """Execute an evaluation run across eligible dataset tickets.
 
@@ -272,12 +276,16 @@ def run_evaluation(
     2. Fixes eligible_count (denominator) before inference begins.
     3. If checkpointing is enabled, validates checkpoint path and identity.
     4. If resume=True, loads existing checkpoint and resumes from saved prefix.
-    5. Makes exactly one model attempt per ticket.
-    6. Classifies responses using classify_response.
-    7. Atomically saves checkpoint after each classified ticket if enabled.
-    8. Catches OperationalError around client invocations and aborts the run,
-       preserving completed results and error diagnostics.
-    9. Verifies exact ticket accounting before returning a completed run.
+    5. Evaluates tickets with a configurable retry budget (default 2 retries,
+       allowing up to 3 total attempts per ticket on eligible failures O1-O3).
+    6. Does not retry valid outputs (O4/O5) or operational failures.
+    7. Provides redacted, actionable error feedback on retry turns.
+    8. Writes structured JSONL failure log entries for tickets with retries
+       or failures if configured.
+    9. Atomically saves checkpoint after each classified ticket if enabled.
+    10. Catches OperationalError around client invocations and aborts the run,
+        preserving completed results and error diagnostics.
+    11. Verifies exact ticket accounting before returning a completed run.
     """
     if resume and checkpoint_path is None:
         raise ValueError("checkpoint_path is required when resume=True.")
@@ -364,31 +372,90 @@ def run_evaluation(
 
     start_index = len(completed_results)
 
+    resolved_retry_budget = (
+        retry_budget if retry_budget is not None else getattr(config, "retry_budget", 2)
+    )
+    resolved_failure_log_path = (
+        failure_log_path
+        if failure_log_path is not None
+        else getattr(config, "failure_log_path", None)
+    )
+    max_attempts = 1 + resolved_retry_budget
+
     for ticket_index, record in enumerate(records):
         if ticket_index < start_index:
             continue
 
-        prompt = prompt_fn(record)
+        base_prompt = prompt_fn(record)
+        current_prompt = base_prompt
+        ticket_raw_responses: list[str] = []
+        attempt_history: list[dict[str, Any]] = []
+        last_ticket_result: TicketRunResult | None = None
 
-        try:
-            raw_response = client.complete(prompt)
-        except OperationalError as exc:
-            return EvaluationRun(
-                config=config,
-                status=RunStatus.ABORTED,
-                eligible_count=eligible_count,
-                dataset_fingerprint=dataset_fingerprint,
-                records=records,
-                completed_results=completed_results,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-                client_type=client_type,
-                model_id=model_id,
-                created_at=resolved_created_at,
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1 and last_ticket_result is not None:
+                feedback = generate_actionable_feedback(
+                    last_ticket_result.outcome,
+                    last_ticket_result.error_message,
+                )
+                current_prompt = (
+                    f"{base_prompt}\n\n"
+                    f"[Previous Attempt Error Feedback]\n"
+                    f"{feedback}\n"
+                    f"Please correct the error(s) and output only a valid JSON object."
+                )
+
+            try:
+                raw_response = client.complete(current_prompt)
+            except OperationalError as exc:
+                return EvaluationRun(
+                    config=config,
+                    status=RunStatus.ABORTED,
+                    eligible_count=eligible_count,
+                    dataset_fingerprint=dataset_fingerprint,
+                    records=records,
+                    completed_results=completed_results,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    client_type=client_type,
+                    model_id=model_id,
+                    created_at=resolved_created_at,
+                )
+
+            ticket_raw_responses.append(raw_response)
+            ticket_result = classify_response(
+                raw_response,
+                record,
+                ticket_index,
+                attempts=attempt,
+                raw_responses=list(ticket_raw_responses),
+            )
+            last_ticket_result = ticket_result
+            attempt_history.append(
+                {
+                    "attempt_index": attempt,
+                    "outcome": ticket_result.outcome,
+                    "error_type": ticket_result.error_type,
+                    "error_message": ticket_result.error_message,
+                }
             )
 
-        ticket_result = classify_response(raw_response, record, ticket_index)
-        completed_results.append(ticket_result)
+            # If the response is valid (O4 or O5), no further attempts are permitted
+            if ticket_result.outcome not in FAILURE_OUTCOMES:
+                break
+
+        assert last_ticket_result is not None
+        completed_results.append(last_ticket_result)
+
+        # Log failure transition if failure logging is configured
+        if resolved_failure_log_path is not None and (
+            len(attempt_history) > 1 or last_ticket_result.outcome in FAILURE_OUTCOMES
+        ):
+            log_entry = create_failure_log_entry(
+                ticket_index=ticket_index,
+                attempts=attempt_history,
+            )
+            append_failure_log(log_entry, resolved_failure_log_path)
 
         if target_cp_path is not None and prompt_fingerprint is not None:
             checkpoint = EvaluationCheckpoint(
